@@ -188,7 +188,7 @@ def main():
         config.trainer.workers = 1
         config.trainer.load_num = -1
         config.trainer.batch_size = 16
-        config.trainer.epoch = 80
+        config.trainer.epoch = 120
 
     resume_path = Path(args.resume) if args.resume else None
 
