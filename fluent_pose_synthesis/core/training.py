@@ -315,7 +315,10 @@ class PoseTrainingPortal(BaseTrainingPortal):
         """
         with torch.no_grad():
             # 1. Autoregressive inference (extracted from original implementation)
-            gt_fluent_full_loader = batch_data["full_fluent_reference"].to(self.device)
+            gt_fluent_full_loader = batch_data["data"].to(self.device)
+
+            if gt_fluent_full_loader is not None:
+                gt_fluent_full_loader = gt_fluent_full_loader.to(self.device)
             disfluent_cond_seq_loader = batch_data["conditions"]["input_sequence"].to(self.device)
             initial_history_loader = batch_data["conditions"]["previous_output"].to(self.device)
             # Permute formats and prepare history
@@ -334,7 +337,9 @@ class PoseTrainingPortal(BaseTrainingPortal):
             D_feat = self.config.arch.dims
             # DYNAMIC MAX_LEN CALCULATION
             # Get the lengths of the disfluent sequences from the batch metadata
-            disfluent_lengths = batch_data["metadata"]["disfluent_pose_length"].to(self.device)
+            disfluent_lengths = torch.tensor(
+            [batch_data["conditions"]["input_sequence"].shape[1]],
+             device=self.device)
             # Apply 200-frame upper bound to disfluent lengths
             len_for_calc = torch.min(disfluent_lengths, torch.tensor(200.0, device=self.device))
             # Linear regression-based mapping from disfluent to fluent length
@@ -409,7 +414,9 @@ class PoseTrainingPortal(BaseTrainingPortal):
             refs, preds = [], []
             for i in range(gt_unnorm.shape[0]):
                 # Retrieve original reference length to truncate padded frames
-                original_lengths = batch_data["metadata"]["fluent_pose_length"]
+                original_lengths = torch.tensor(
+                [x_start.shape[1]],
+                device=self.device)
                 current_original_length = int(original_lengths[i])
                 fps = getattr(self.val_pose_header, "fps", 25.0)
                 # Truncate to original length before reshaping
@@ -492,7 +499,8 @@ class PoseTrainingPortal(BaseTrainingPortal):
 
             data_len = len(self.dataloader)
 
-            for datas in self.dataloader:
+            for step, datas in enumerate(tqdm(self.dataloader, desc=f"Epoch {epoch_idx}")):
+
                 datas = {key: val.to(self.device) if torch.is_tensor(val) else val for key, val in datas.items()}
                 cond = {
                     key: val.to(self.device) if torch.is_tensor(val) else val
@@ -598,8 +606,7 @@ class PoseTrainingPortal(BaseTrainingPortal):
 
             # Validation Phase
             eval_freq = getattr(self.config.trainer, "eval_freq", 1)
-            if self.validation_dataloader is not None and (self.epoch % eval_freq == 0
-                                                           or self.epoch == self.config.trainer.epoch - 1):
+            if False:
                 current_validation_metric = self._run_validation_epoch()
                 # Log the validation metric to TensorBoard
                 if self.tb_writer and current_validation_metric is not None:

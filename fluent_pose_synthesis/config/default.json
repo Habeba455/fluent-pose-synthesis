@@ -21,7 +21,7 @@
         "sigma_small": true
     },
     "trainer": {
-        "epoch": 500,
+        "epoch": 50,
         "lr": 0.0001,
         "batch_size": 32,
         "cond_mask_prob": 0.15,
@@ -35,7 +35,7 @@
         "load_num": -1,
         "validation_chunk_size": 40,
         "validation_stop_threshold": 0.0001,
-        "eval_freq": 1,
+        "eval_freq": 1000,
         "use_amp": false
     }
 }

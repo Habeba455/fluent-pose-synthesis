@@ -85,7 +85,7 @@ def train(config, resume_path, logger, tb_writer):
 
     validation_dataset = SignLanguagePoseDataset(
         data_dir=config.data,
-        split="validation",
+        split="val",
         chunk_len=config.arch.chunk_len,
         history_len=getattr(config.arch, "history_len", 10),
         dtype=np_dtype,
@@ -188,7 +188,7 @@ def main():
         config.trainer.workers = 1
         config.trainer.load_num = -1
         config.trainer.batch_size = 16
-        config.trainer.epoch = 300
+        config.trainer.epoch = 80
 
     resume_path = Path(args.resume) if args.resume else None
 

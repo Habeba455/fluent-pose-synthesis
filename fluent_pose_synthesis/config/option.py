@@ -43,7 +43,7 @@ def add_train_args(parser):
 
     parser.add_argument('--ema', action='store_true', help='Use Exponential Moving Average.')
 
-    parser.add_argument('--lambda_vel', type=float, default=0.0, help='Velocity loss weight.')
+    parser.add_argument('--lambda_vel', type=float, default=0.5, help='Velocity loss weight.')
 
     parser.add_argument('--use_loss_vel', action='store_true', default=True)
 
