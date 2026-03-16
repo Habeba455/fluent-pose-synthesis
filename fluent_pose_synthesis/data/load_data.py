@@ -163,28 +163,29 @@ class SignLanguagePoseDataset(Dataset):
 
     def __getitem__(self, idx):
 
-        motion_idx, start = self.train_indices[idx]
+    motion_idx, start = self.train_indices[idx]
+    end = start + self.window_len
 
-        end = start + self.window_len
+    full_seq = self.fluent_clip_list[motion_idx][start:end]
+    disfluent_seq = self.disfluent_clip_list[motion_idx][start:end]
 
-        full_seq = self.fluent_clip_list[motion_idx][start:end]
+    full_seq = torch.from_numpy(full_seq.astype(np.float32))
+    disfluent_seq = torch.from_numpy(disfluent_seq.astype(np.float32))
 
-        disfluent_seq = self.disfluent_clip_list[motion_idx]
+    history_len = self.history_len
 
-        full_seq = torch.from_numpy(full_seq.astype(np.float32))
-        disfluent_seq = torch.from_numpy(disfluent_seq.astype(np.float32))
+    previous_output = full_seq[:history_len]
+    target_seq = full_seq[history_len:]
 
-        history_len = self.history_len
+    print("NEW GETITEM RUNNING")
+    print("target_seq:", target_seq.shape)
+    print("disfluent_seq:", disfluent_seq.shape)
+    print("previous_output:", previous_output.shape)
 
-        num_keypoints = full_seq.shape[1]
-        num_dims = full_seq.shape[2]
-
-        previous_output = torch.zeros((history_len, num_keypoints, num_dims))
-
-        return {
-            "data": full_seq,
-            "conditions": {
-                "input_sequence": disfluent_seq,
-                "previous_output": previous_output,
-            },
-        }
+    return {
+        "data": target_seq,
+        "conditions": {
+            "input_sequence": disfluent_seq,
+            "previous_output": previous_output,
+        },
+    }
