@@ -49,6 +49,93 @@ def patched_torch_load(*args, **kwargs):
 torch.load = patched_torch_load
 
 
+def _to_numpy(x):
+    if isinstance(x, np.ndarray):
+        return x
+    if torch.is_tensor(x):
+        return x.detach().cpu().numpy()
+    return None
+
+
+def _find_pose_feature_dim(obj):
+    """
+    يبحث جوه sample من الـ dataset عن tensor/array شكلها pose.
+    بيرجع:
+      - feature_dim
+      - original_shape
+      - source_name
+    """
+
+    candidates = []
+
+    def walk(x, name="root"):
+        arr = _to_numpy(x)
+        if arr is not None:
+            shape = tuple(arr.shape)
+
+            # حالات شائعة:
+            # [T, F]
+            if arr.ndim == 2 and shape[-1] > 0:
+                candidates.append((shape[-1], shape, name))
+
+            # [B, T, F] أو [T, 1, K, D]
+            elif arr.ndim == 3 and shape[-1] > 0:
+                candidates.append((shape[-1], shape, name))
+
+            elif arr.ndim == 4:
+                # لو [T,1,K,D] أو [B,T,K,D]
+                if shape[-1] in (2, 3, 4) and shape[-2] > 0:
+                    feat_dim = shape[-2] * shape[-1]
+                    candidates.append((feat_dim, shape, name))
+                elif shape[-1] > 0:
+                    candidates.append((shape[-1], shape, name))
+            return
+
+        if isinstance(x, dict):
+            for k, v in x.items():
+                walk(v, f"{name}.{k}")
+        elif isinstance(x, (list, tuple)):
+            for i, v in enumerate(x):
+                walk(v, f"{name}[{i}]")
+
+    walk(obj)
+
+    if not candidates:
+        raise RuntimeError("Could not infer pose feature dimension from dataset sample.")
+
+    # نختار أكبر feature dim غالبًا ده الـ pose الحقيقي
+    candidates.sort(key=lambda z: z[0], reverse=True)
+    return candidates[0]
+
+
+def infer_arch_from_dataset(dataset, logger, default_dims=3):
+    """
+    يستنتج keypoints و dims من أول sample في الداتا.
+    """
+
+    if len(dataset) == 0:
+        raise RuntimeError("Dataset is empty, cannot infer input feature size.")
+
+    sample = dataset[0]
+    feature_dim, original_shape, source_name = _find_pose_feature_dim(sample)
+
+    dims = default_dims
+    if feature_dim % dims != 0:
+        raise RuntimeError(
+            f"Inferred feature dim = {feature_dim} from {source_name} with shape {original_shape}, "
+            f"but it is not divisible by dims={dims}."
+        )
+
+    keypoints = feature_dim // dims
+
+    logger.info(
+        f"[AUTO-INFER] Found pose source: {source_name}, shape={original_shape}, "
+        f"feature_dim={feature_dim}, dims={dims}, keypoints={keypoints}"
+    )
+
+    return keypoints, dims, feature_dim
+
+
 def train(config, resume_path, logger, tb_writer):
 
     np_dtype = select_platform(32)
@@ -65,6 +152,27 @@ def train(config, resume_path, logger, tb_writer):
         min_condition_length=10,
         fixed_condition_length=-1
     )
+
+    # =========================
+    # AUTO SYNC MODEL INPUT WITH DATASET
+    # =========================
+    inferred_keypoints, inferred_dims, inferred_input_feats = infer_arch_from_dataset(
+        train_dataset,
+        logger,
+        default_dims=getattr(config.arch, "dims", 3)
+    )
+
+    logger.info(
+        f"[AUTO-UPDATE] Overriding config.arch.keypoints: "
+        f"{getattr(config.arch, 'keypoints', 'N/A')} -> {inferred_keypoints}"
+    )
+    logger.info(
+        f"[AUTO-UPDATE] Using config.arch.dims: "
+        f"{getattr(config.arch, 'dims', 'N/A')} -> {inferred_dims}"
+    )
+
+    config.arch.keypoints = inferred_keypoints
+    config.arch.dims = inferred_dims
 
     train_dataloader = DataLoader(
         train_dataset,
@@ -108,7 +216,12 @@ def train(config, resume_path, logger, tb_writer):
 
     diffusion = create_gaussian_diffusion(config)
 
-    input_feats = config.arch.keypoints * config.arch.dims
+    input_feats = inferred_input_feats
+
+    logger.info(
+        f"[MODEL INPUT] keypoints={config.arch.keypoints}, "
+        f"dims={config.arch.dims}, input_feats={input_feats}"
+    )
 
     model = SignLanguagePoseDiffusion(
         input_feats=input_feats,
@@ -128,7 +241,7 @@ def train(config, resume_path, logger, tb_writer):
         device=config.device,
     ).to(config.device)
 
-    logger.info(f"Model created successfully")
+    logger.info("Model created successfully")
 
     trainer = PoseTrainingPortal(
         config,
