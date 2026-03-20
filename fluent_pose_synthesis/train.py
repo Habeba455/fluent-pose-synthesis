@@ -40,16 +40,17 @@ torch.serialization.add_safe_globals([
 
 _original_torch_load = torch.load
 
+
 def patched_torch_load(*args, **kwargs):
     kwargs.setdefault("weights_only", False)
     if not torch.cuda.is_available():
         kwargs.setdefault("map_location", torch.device("cpu"))
     return _original_torch_load(*args, **kwargs)
 
+
 torch.load = patched_torch_load
 
 
-<<<<<<< HEAD
 def _to_numpy(x):
     if isinstance(x, np.ndarray):
         return x
@@ -66,7 +67,6 @@ def _find_pose_feature_dim(obj):
       - original_shape
       - source_name
     """
-
     candidates = []
 
     def walk(x, name="root"):
@@ -74,7 +74,6 @@ def _find_pose_feature_dim(obj):
         if arr is not None:
             shape = tuple(arr.shape)
 
-            # حالات شائعة:
             # [T, F]
             if arr.ndim == 2 and shape[-1] > 0:
                 candidates.append((shape[-1], shape, name))
@@ -84,7 +83,7 @@ def _find_pose_feature_dim(obj):
                 candidates.append((shape[-1], shape, name))
 
             elif arr.ndim == 4:
-                # لو [T,1,K,D] أو [B,T,K,D]
+                # [T,1,K,D] أو [B,T,K,D]
                 if shape[-1] in (2, 3, 4) and shape[-2] > 0:
                     feat_dim = shape[-2] * shape[-1]
                     candidates.append((feat_dim, shape, name))
@@ -104,7 +103,6 @@ def _find_pose_feature_dim(obj):
     if not candidates:
         raise RuntimeError("Could not infer pose feature dimension from dataset sample.")
 
-    # نختار أكبر feature dim غالبًا ده الـ pose الحقيقي
     candidates.sort(key=lambda z: z[0], reverse=True)
     return candidates[0]
 
@@ -113,7 +111,6 @@ def infer_arch_from_dataset(dataset, logger, default_dims=3):
     """
     يستنتج keypoints و dims من أول sample في الداتا.
     """
-
     if len(dataset) == 0:
         raise RuntimeError("Dataset is empty, cannot infer input feature size.")
 
@@ -137,10 +134,7 @@ def infer_arch_from_dataset(dataset, logger, default_dims=3):
     return keypoints, dims, feature_dim
 
 
-=======
->>>>>>> 6fc953b1cada2f8940a7b94c832f727043796237
 def train(config, resume_path, logger, tb_writer):
-
     np_dtype = select_platform(32)
 
     logger.info("Loading training dataset...")
@@ -153,17 +147,16 @@ def train(config, resume_path, logger, tb_writer):
         dtype=np_dtype,
         limited_num=config.trainer.load_num,
         min_condition_length=10,
-        fixed_condition_length=-1
+        fixed_condition_length=-1,
     )
 
-<<<<<<< HEAD
     # =========================
     # AUTO SYNC MODEL INPUT WITH DATASET
     # =========================
     inferred_keypoints, inferred_dims, inferred_input_feats = infer_arch_from_dataset(
         train_dataset,
         logger,
-        default_dims=getattr(config.arch, "dims", 3)
+        default_dims=getattr(config.arch, "dims", 3),
     )
 
     logger.info(
@@ -178,8 +171,6 @@ def train(config, resume_path, logger, tb_writer):
     config.arch.keypoints = inferred_keypoints
     config.arch.dims = inferred_dims
 
-=======
->>>>>>> 6fc953b1cada2f8940a7b94c832f727043796237
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=config.trainer.batch_size,
@@ -205,7 +196,7 @@ def train(config, resume_path, logger, tb_writer):
         dtype=np_dtype,
         limited_num=config.trainer.load_num,
         min_condition_length=10,
-        fixed_condition_length=-1
+        fixed_condition_length=-1,
     )
 
     validation_dataloader = DataLoader(
@@ -222,16 +213,12 @@ def train(config, resume_path, logger, tb_writer):
 
     diffusion = create_gaussian_diffusion(config)
 
-<<<<<<< HEAD
     input_feats = inferred_input_feats
 
     logger.info(
         f"[MODEL INPUT] keypoints={config.arch.keypoints}, "
         f"dims={config.arch.dims}, input_feats={input_feats}"
     )
-=======
-    input_feats = config.arch.keypoints * config.arch.dims
->>>>>>> 6fc953b1cada2f8940a7b94c832f727043796237
 
     model = SignLanguagePoseDiffusion(
         input_feats=input_feats,
@@ -251,11 +238,7 @@ def train(config, resume_path, logger, tb_writer):
         device=config.device,
     ).to(config.device)
 
-<<<<<<< HEAD
     logger.info("Model created successfully")
-=======
-    logger.info(f"Model created successfully")
->>>>>>> 6fc953b1cada2f8940a7b94c832f727043796237
 
     trainer = PoseTrainingPortal(
         config,
@@ -264,7 +247,7 @@ def train(config, resume_path, logger, tb_writer):
         train_dataloader,
         logger,
         tb_writer,
-        validation_dataloader=validation_dataloader
+        validation_dataloader=validation_dataloader,
     )
 
     if resume_path is not None:
@@ -281,12 +264,11 @@ def train(config, resume_path, logger, tb_writer):
 
     trainer.run_loop(
         enable_profiler=False,
-        profiler_directory=str(profiler_dir)
+        profiler_directory=str(profiler_dir),
     )
 
 
 def main():
-
     start_time = time.time()
 
     parser = argparse.ArgumentParser()
@@ -322,7 +304,6 @@ def main():
     config.save.mkdir(parents=True, exist_ok=True)
 
     logger = Logger(config.save / "log.txt")
-
     tb_writer = SummaryWriter(log_dir=config.save / "runtime")
 
     if torch.cuda.is_available():
