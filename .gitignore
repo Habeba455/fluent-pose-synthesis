@@ -1,0 +1,19 @@
+cat > .gitignore << 'EOF'
+mp_env/
+venv/
+.venv/
+pose_env/
+__pycache__/
+*.pyc
+.DS_Store
+assets/dataset/
+final_dataset/
+processed_for_training/
+processed_gifs/
+raw_poses/
+raw_videos/
+*.mp4
+*.gif
+EOF
+assets/dataset.zip
+assets/dataset/

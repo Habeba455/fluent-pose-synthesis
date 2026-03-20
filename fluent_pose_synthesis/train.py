@@ -49,6 +49,7 @@ def patched_torch_load(*args, **kwargs):
 torch.load = patched_torch_load
 
 
+<<<<<<< HEAD
 def _to_numpy(x):
     if isinstance(x, np.ndarray):
         return x
@@ -136,6 +137,8 @@ def infer_arch_from_dataset(dataset, logger, default_dims=3):
     return keypoints, dims, feature_dim
 
 
+=======
+>>>>>>> 6fc953b1cada2f8940a7b94c832f727043796237
 def train(config, resume_path, logger, tb_writer):
 
     np_dtype = select_platform(32)
@@ -153,6 +156,7 @@ def train(config, resume_path, logger, tb_writer):
         fixed_condition_length=-1
     )
 
+<<<<<<< HEAD
     # =========================
     # AUTO SYNC MODEL INPUT WITH DATASET
     # =========================
@@ -174,6 +178,8 @@ def train(config, resume_path, logger, tb_writer):
     config.arch.keypoints = inferred_keypoints
     config.arch.dims = inferred_dims
 
+=======
+>>>>>>> 6fc953b1cada2f8940a7b94c832f727043796237
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=config.trainer.batch_size,
@@ -216,12 +222,16 @@ def train(config, resume_path, logger, tb_writer):
 
     diffusion = create_gaussian_diffusion(config)
 
+<<<<<<< HEAD
     input_feats = inferred_input_feats
 
     logger.info(
         f"[MODEL INPUT] keypoints={config.arch.keypoints}, "
         f"dims={config.arch.dims}, input_feats={input_feats}"
     )
+=======
+    input_feats = config.arch.keypoints * config.arch.dims
+>>>>>>> 6fc953b1cada2f8940a7b94c832f727043796237
 
     model = SignLanguagePoseDiffusion(
         input_feats=input_feats,
@@ -241,7 +251,11 @@ def train(config, resume_path, logger, tb_writer):
         device=config.device,
     ).to(config.device)
 
+<<<<<<< HEAD
     logger.info("Model created successfully")
+=======
+    logger.info(f"Model created successfully")
+>>>>>>> 6fc953b1cada2f8940a7b94c832f727043796237
 
     trainer = PoseTrainingPortal(
         config,
