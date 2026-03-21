@@ -27,7 +27,6 @@ from fluent_pose_synthesis.config.option import (
     config_parse,
 )
 
-# Safe globals
 torch.serialization.add_safe_globals([
     SimpleNamespace,
     PosixPath,
@@ -60,13 +59,6 @@ def _to_numpy(x):
 
 
 def _find_pose_feature_dim(obj):
-    """
-    يبحث جوه sample من الـ dataset عن tensor/array شكلها pose.
-    بيرجع:
-      - feature_dim
-      - original_shape
-      - source_name
-    """
     candidates = []
 
     def walk(x, name="root"):
@@ -74,16 +66,17 @@ def _find_pose_feature_dim(obj):
         if arr is not None:
             shape = tuple(arr.shape)
 
-            # [T, F]
             if arr.ndim == 2 and shape[-1] > 0:
                 candidates.append((shape[-1], shape, name))
 
-            # [B, T, F] أو [T, 1, K, D]
-            elif arr.ndim == 3 and shape[-1] > 0:
-                candidates.append((shape[-1], shape, name))
+            elif arr.ndim == 3:
+                if shape[-1] in (2, 3, 4) and shape[-2] > 0:
+                    feat_dim = shape[-2] * shape[-1]
+                    candidates.append((feat_dim, shape, name))
+                elif shape[-1] > 0:
+                    candidates.append((shape[-1], shape, name))
 
             elif arr.ndim == 4:
-                # [T,1,K,D] أو [B,T,K,D]
                 if shape[-1] in (2, 3, 4) and shape[-2] > 0:
                     feat_dim = shape[-2] * shape[-1]
                     candidates.append((feat_dim, shape, name))
@@ -108,9 +101,6 @@ def _find_pose_feature_dim(obj):
 
 
 def infer_arch_from_dataset(dataset, logger, default_dims=3):
-    """
-    يستنتج keypoints و dims من أول sample في الداتا.
-    """
     if len(dataset) == 0:
         raise RuntimeError("Dataset is empty, cannot infer input feature size.")
 
@@ -150,9 +140,6 @@ def train(config, resume_path, logger, tb_writer):
         fixed_condition_length=-1,
     )
 
-    # =========================
-    # AUTO SYNC MODEL INPUT WITH DATASET
-    # =========================
     inferred_keypoints, inferred_dims, inferred_input_feats = infer_arch_from_dataset(
         train_dataset,
         logger,
