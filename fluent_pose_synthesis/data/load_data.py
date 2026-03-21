@@ -10,25 +10,24 @@ from pose_format import Pose
 
 
 def resample_sequence(seq, target_len):
-    T = seq.shape[0]
-    if T == target_len:
+    t = seq.shape[0]
+    if t == target_len:
         return seq.copy()
 
-    old_idx = np.linspace(0, T - 1, T)
-    new_idx = np.linspace(0, T - 1, target_len)
+    old_idx = np.linspace(0, t - 1, t)
+    new_idx = np.linspace(0, t - 1, target_len)
 
-    _, K, D = seq.shape
-    out = np.zeros((target_len, K, D), dtype=seq.dtype)
+    _, k, d = seq.shape
+    out = np.zeros((target_len, k, d), dtype=seq.dtype)
 
-    for k in range(K):
-        for d in range(D):
-            out[:, k, d] = np.interp(new_idx, old_idx, seq[:, k, d])
+    for ki in range(k):
+        for di in range(d):
+            out[:, ki, di] = np.interp(new_idx, old_idx, seq[:, ki, di])
 
     return out
 
 
 class SignLanguagePoseDataset(Dataset):
-
     def __init__(
         self,
         data_dir: Path,
@@ -40,7 +39,6 @@ class SignLanguagePoseDataset(Dataset):
         min_condition_length: int = 0,
         fixed_condition_length: int = -1,
     ):
-
         self.data_dir = data_dir
         self.split = split
         self.chunk_len = chunk_len
@@ -49,24 +47,22 @@ class SignLanguagePoseDataset(Dataset):
         self.dtype = dtype
 
         self.pose_header = None
+        self.keypoints = None
+        self.dims = None
 
         split_dir = self.data_dir / split
-
         self.examples = []
 
         fluent_files = sorted(list(split_dir.glob(f"{split}_*_original.pose")))
-
         if limited_num > 0:
             fluent_files = fluent_files[:limited_num]
 
         print(f"Found {len(fluent_files)} pose files")
 
         for fluent_file in tqdm(fluent_files, desc=f"Loading {split} examples"):
-
             disfluent_file = fluent_file.with_name(
                 fluent_file.name.replace("_original.pose", "_updated.pose")
             )
-
             metadata_file = fluent_file.with_name(
                 fluent_file.name.replace("_original.pose", "_metadata.json")
             )
@@ -91,9 +87,7 @@ class SignLanguagePoseDataset(Dataset):
         self.disfluent_clip_list = []
 
         for example in tqdm(self.examples, desc="Processing pose files"):
-
             try:
-
                 with open(example["fluent_path"], "rb") as f:
                     fluent_pose = Pose.read(f.read())
 
@@ -112,19 +106,20 @@ class SignLanguagePoseDataset(Dataset):
                 if fluent_seq.ndim != 3 or disfluent_seq.ndim != 3:
                     continue
 
-                Tf, Kf, Df = fluent_seq.shape
-                Td, Kd, Dd = disfluent_seq.shape
+                tf, kf, df = fluent_seq.shape
+                td, kd, dd = disfluent_seq.shape
 
-                if Kf != Kd or Df != Dd:
+                if kf != kd or df != dd:
                     continue
 
-                disfluent_seq = resample_sequence(disfluent_seq, Tf)
+                if self.keypoints is None:
+                    self.keypoints = kf
+                    self.dims = df
 
-                fluent_seq = fluent_seq.reshape(Tf, Kf * Df)
-                disfluent_seq = disfluent_seq.reshape(Tf, Kd * Dd)
+                disfluent_seq = resample_sequence(disfluent_seq, tf)
 
-                self.fluent_clip_list.append(fluent_seq)
-                self.disfluent_clip_list.append(disfluent_seq)
+                self.fluent_clip_list.append(fluent_seq.astype(self.dtype))
+                self.disfluent_clip_list.append(disfluent_seq.astype(self.dtype))
 
             except Exception:
                 continue
@@ -169,7 +164,6 @@ class SignLanguagePoseDataset(Dataset):
         return len(self.train_indices)
 
     def __getitem__(self, idx):
-
         motion_idx, start = self.train_indices[idx]
         end = start + self.window_len
 
