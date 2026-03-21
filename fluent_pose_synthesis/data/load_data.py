@@ -70,23 +70,8 @@ class SignLanguagePoseDataset(Dataset):
         print(f"Valid examples: {len(self.examples)}")
 
         self.fluent_clip_list = []
-        self.fluent_mask_list = []
         self.disfluent_clip_list = []
 
-<<<<<<< HEAD
-        self.feature_dim = None
-        self.num_keypoints = None
-        self.num_dims = None
-
-        for example in tqdm(self.examples, desc="Processing pose files"):
-
-            try:
-                with open(example["fluent_path"], "rb") as f:
-                    fluent_pose = Pose.read(f.read())
-
-                with open(example["disfluent_path"], "rb") as f:
-                    disfluent_pose = Pose.read(f.read())
-=======
         for example in tqdm(self.examples, desc="Processing pose files"):
 
             try:
@@ -96,75 +81,25 @@ class SignLanguagePoseDataset(Dataset):
 
                 with open(example["disfluent_path"], "rb") as f:
                     disfluent_pose = Pose.read(f)
->>>>>>> 6fc953b1cada2f8940a7b94c832f727043796237
 
                 if self.pose_header is None:
                     self.pose_header = fluent_pose.header
 
                 fluent_data = np.array(fluent_pose.body.data.astype(self.dtype))
-<<<<<<< HEAD
-                fluent_mask = np.array(fluent_pose.body.data.mask)
                 disfluent_data = np.array(disfluent_pose.body.data.astype(self.dtype))
 
-                # expected shape: [T, 1, K, D]
-=======
-                fluent_mask = fluent_pose.body.data.mask
+                # =========================
+                # IMPORTANT FIX 🔥
+                # =========================
+                fluent_seq = fluent_data[:, 0]        # [T, K, D]
+                disfluent_seq = disfluent_data[:, 0]  # [T, K, D]
 
-                disfluent_data = np.array(disfluent_pose.body.data.astype(self.dtype))
-
->>>>>>> 6fc953b1cada2f8940a7b94c832f727043796237
-                fluent_seq = fluent_data[:, 0]
-                mask_seq = fluent_mask[:, 0]
-                disfluent_seq = disfluent_data[:, 0]
-
-<<<<<<< HEAD
-                if fluent_seq.ndim != 3 or disfluent_seq.ndim != 3:
-                    raise ValueError(
-                        f"Expected pose shape [T, K, D], got "
-                        f"fluent={fluent_seq.shape}, disfluent={disfluent_seq.shape}"
-                    )
-
-                if fluent_seq.shape != disfluent_seq.shape:
-                    raise ValueError(
-                        f"Shape mismatch between fluent and disfluent: "
-                        f"{fluent_seq.shape} vs {disfluent_seq.shape}"
-                    )
-
+                # flatten → [T, K*D]
                 T, K, D = fluent_seq.shape
-
-                if self.feature_dim is None:
-                    self.num_keypoints = K
-                    self.num_dims = D
-                    self.feature_dim = K * D
-                    print(
-                        f"[INFO] Detected pose shape: T x {K} x {D} "
-                        f"(flattened feature_dim = {self.feature_dim})"
-                    )
-
-                else:
-                    if K != self.num_keypoints or D != self.num_dims:
-                        raise ValueError(
-                            f"Inconsistent pose dimensions. "
-                            f"Expected K={self.num_keypoints}, D={self.num_dims}, "
-                            f"got K={K}, D={D}"
-                        )
-
-                # flatten from [T, K, D] -> [T, K*D]
                 fluent_seq = fluent_seq.reshape(T, K * D)
                 disfluent_seq = disfluent_seq.reshape(T, K * D)
 
-                # flatten mask from [T, K, D] -> [T, K*D] if needed
-                if mask_seq.ndim == 3:
-                    mask_seq = mask_seq.reshape(mask_seq.shape[0], -1)
-                elif mask_seq.ndim == 2:
-                    pass
-                else:
-                    raise ValueError(f"Unexpected mask shape: {mask_seq.shape}")
-
-=======
->>>>>>> 6fc953b1cada2f8940a7b94c832f727043796237
                 self.fluent_clip_list.append(fluent_seq)
-                self.fluent_mask_list.append(mask_seq)
                 self.disfluent_clip_list.append(disfluent_seq)
 
             except Exception as e:
@@ -173,6 +108,9 @@ class SignLanguagePoseDataset(Dataset):
         if len(self.fluent_clip_list) == 0:
             raise RuntimeError("No valid pose sequences found")
 
+        # =========================
+        # NORMALIZATION
+        # =========================
         concatenated_fluent = np.concatenate(self.fluent_clip_list, axis=0)
         self.input_mean = concatenated_fluent.mean(axis=0, keepdims=True)
         self.input_std = concatenated_fluent.std(axis=0, keepdims=True)
@@ -193,6 +131,9 @@ class SignLanguagePoseDataset(Dataset):
                 self.disfluent_clip_list[i] - self.condition_mean
             ) / self.condition_std
 
+        # =========================
+        # WINDOW SAMPLING
+        # =========================
         self.train_indices = []
 
         for motion_idx in range(len(self.fluent_clip_list)):
@@ -205,12 +146,6 @@ class SignLanguagePoseDataset(Dataset):
                 self.train_indices.append((motion_idx, start))
 
         print("Total training samples:", len(self.train_indices))
-<<<<<<< HEAD
-        print("Feature dim:", self.feature_dim)
-        print("Num keypoints:", self.num_keypoints)
-        print("Num dims:", self.num_dims)
-=======
->>>>>>> 6fc953b1cada2f8940a7b94c832f727043796237
 
     def __len__(self):
         return len(self.train_indices)
