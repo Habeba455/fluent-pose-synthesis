@@ -9,6 +9,24 @@ from tqdm import tqdm
 from pose_format import Pose
 
 
+def resample_sequence(seq, target_len):
+    T = seq.shape[0]
+    if T == target_len:
+        return seq.copy()
+
+    old_idx = np.linspace(0, T - 1, T)
+    new_idx = np.linspace(0, T - 1, target_len)
+
+    _, K, D = seq.shape
+    out = np.zeros((target_len, K, D), dtype=seq.dtype)
+
+    for k in range(K):
+        for d in range(D):
+            out[:, k, d] = np.interp(new_idx, old_idx, seq[:, k, d])
+
+    return out
+
+
 class SignLanguagePoseDataset(Dataset):
 
     def __init__(
@@ -77,40 +95,43 @@ class SignLanguagePoseDataset(Dataset):
             try:
 
                 with open(example["fluent_path"], "rb") as f:
-                    fluent_pose = Pose.read(f)
+                    fluent_pose = Pose.read(f.read())
 
                 with open(example["disfluent_path"], "rb") as f:
-                    disfluent_pose = Pose.read(f)
+                    disfluent_pose = Pose.read(f.read())
 
                 if self.pose_header is None:
                     self.pose_header = fluent_pose.header
 
-                fluent_data = np.array(fluent_pose.body.data.astype(self.dtype))
-                disfluent_data = np.array(disfluent_pose.body.data.astype(self.dtype))
+                fluent_data = np.asarray(fluent_pose.body.data.astype(self.dtype))
+                disfluent_data = np.asarray(disfluent_pose.body.data.astype(self.dtype))
 
-                # =========================
-                # IMPORTANT FIX 🔥
-                # =========================
-                fluent_seq = fluent_data[:, 0]        # [T, K, D]
-                disfluent_seq = disfluent_data[:, 0]  # [T, K, D]
+                fluent_seq = fluent_data[:, 0]
+                disfluent_seq = disfluent_data[:, 0]
 
-                # flatten → [T, K*D]
-                T, K, D = fluent_seq.shape
-                fluent_seq = fluent_seq.reshape(T, K * D)
-                disfluent_seq = disfluent_seq.reshape(T, K * D)
+                if fluent_seq.ndim != 3 or disfluent_seq.ndim != 3:
+                    continue
+
+                Tf, Kf, Df = fluent_seq.shape
+                Td, Kd, Dd = disfluent_seq.shape
+
+                if Kf != Kd or Df != Dd:
+                    continue
+
+                disfluent_seq = resample_sequence(disfluent_seq, Tf)
+
+                fluent_seq = fluent_seq.reshape(Tf, Kf * Df)
+                disfluent_seq = disfluent_seq.reshape(Tf, Kd * Dd)
 
                 self.fluent_clip_list.append(fluent_seq)
                 self.disfluent_clip_list.append(disfluent_seq)
 
-            except Exception as e:
-                print("Skipping corrupted pose:", e)
+            except Exception:
+                continue
 
         if len(self.fluent_clip_list) == 0:
             raise RuntimeError("No valid pose sequences found")
 
-        # =========================
-        # NORMALIZATION
-        # =========================
         concatenated_fluent = np.concatenate(self.fluent_clip_list, axis=0)
         self.input_mean = concatenated_fluent.mean(axis=0, keepdims=True)
         self.input_std = concatenated_fluent.std(axis=0, keepdims=True)
@@ -131,9 +152,6 @@ class SignLanguagePoseDataset(Dataset):
                 self.disfluent_clip_list[i] - self.condition_mean
             ) / self.condition_std
 
-        # =========================
-        # WINDOW SAMPLING
-        # =========================
         self.train_indices = []
 
         for motion_idx in range(len(self.fluent_clip_list)):
