@@ -432,10 +432,18 @@ class PoseTrainingPortal(BaseTrainingPortal):
         else:
             profiler = None
 
-        sampling_num = min(16, len(self.dataloader.dataset))
+        sampling_num = min(4, len(self.dataloader.dataset))
         sampling_idx = np.random.randint(0, len(self.dataloader.dataset), sampling_num)
-        sampling_subset = DataLoader(Subset(self.dataloader.dataset, sampling_idx), batch_size=sampling_num)
-        self.evaluate_sampling(sampling_subset, save_folder_name="init_samples")
+        sampling_subset = DataLoader(
+            Subset(self.dataloader.dataset, sampling_idx),
+            batch_size=min(2, sampling_num),
+            shuffle=False,
+            num_workers=0,
+            collate_fn=zero_pad_collator,
+        )
+
+        # disabled for fast CPU training
+        # self.evaluate_sampling(sampling_subset, save_folder_name="init_samples")
 
         if self.validation_dataloader is not None:
             num_to_save = getattr(self.config.trainer, "validation_save_num", 30)
@@ -563,7 +571,8 @@ class PoseTrainingPortal(BaseTrainingPortal):
             save_freq = max(1, int(getattr(self.config.trainer, "save_freq", 1)))
             if epoch_idx > 0 and epoch_idx % save_freq == 0:
                 self.save_checkpoint(filename=f"weights_{epoch_idx}")
-                self.evaluate_sampling(sampling_subset, save_folder_name="train_samples")
+                # disabled for fast CPU training
+                # self.evaluate_sampling(sampling_subset, save_folder_name="train_samples")
 
             if self.tb_writer:
                 for key_name in epoch_losses.keys():
@@ -663,8 +672,9 @@ class PoseTrainingPortal(BaseTrainingPortal):
                         )
 
         best_path = f"{self.config.save}/best.pt"
-        self.load_checkpoint(best_path)
-        self.evaluate_sampling(sampling_subset, save_folder_name="best")
+        # disabled for fast CPU training
+        # self.load_checkpoint(best_path)
+        # self.evaluate_sampling(sampling_subset, save_folder_name="best")
 
     def evaluate_sampling(self, dataloader: DataLoader, save_folder_name: str = "init_samples"):
         """
