@@ -13,6 +13,11 @@ from CAMDM.diffusion.create_diffusion import create_gaussian_diffusion
 
 
 class DummyDataset(Dataset):
+    def __init__(self, keypoints=178, dims=3):
+        self.input_mean = np.zeros((keypoints, dims), dtype=np.float32)
+        self.input_std = np.ones((keypoints, dims), dtype=np.float32)
+        self.pose_header = None
+
     def __len__(self):
         return 1
 
@@ -30,7 +35,9 @@ def get_toy_batch(batch_size=2, seq_len=40, keypoints=178, dims=3):
     """
     assert batch_size == 2, "This toy batch currently assumes batch_size=2"
 
-    base_linear = torch.linspace(0, 1, seq_len * keypoints * dims).reshape(seq_len, keypoints, dims)
+    base_linear = torch.linspace(
+        0, 1, seq_len * keypoints * dims
+    ).reshape(seq_len, keypoints, dims)
 
     sine_t = torch.sin(torch.linspace(0, 4 * np.pi, seq_len)).view(seq_len, 1, 1)
     base_sine = sine_t.expand(seq_len, keypoints, dims)
@@ -59,8 +66,7 @@ def get_toy_batch(batch_size=2, seq_len=40, keypoints=178, dims=3):
 
         pose_data.append(sample)
 
-        # target_mask: True = masked/invalid
-        # frame_valid True means valid -> mask False
+        # True = masked/invalid
         frame_mask = (~frame_valid).view(seq_len, 1, 1).expand(seq_len, keypoints, dims)
         target_mask.append(frame_mask)
 
@@ -141,8 +147,6 @@ def compute_average_keypoint_error(pose1, pose2):
     pose shape expected: [B, K, D, T]
     """
     assert pose1.shape == pose2.shape, "Shape mismatch"
-    # move time to second dim for readability if needed is not necessary;
-    # just compute per-keypoint L2 over D
     diff = torch.norm(pose1 - pose2, dim=2)  # [B, K, T]
     return diff.mean().item()
 
@@ -160,7 +164,12 @@ def test_overfit_toy_batch():
     random.seed(0)
 
     config = create_minimal_config(device="cpu")
-    dummy_dataloader = DataLoader(DummyDataset())
+    dummy_dataloader = DataLoader(
+        DummyDataset(
+            keypoints=config.arch.keypoints,
+            dims=config.arch.dims,
+        )
+    )
 
     batch = get_toy_batch(
         batch_size=config.trainer.batch_size,
@@ -227,7 +236,6 @@ def test_overfit_toy_batch():
     with torch.no_grad():
         t, _ = trainer.schedule_sampler.sample(1, config.device)
 
-        # Direct model call expects [B, K, D, T]
         fluent_1 = batch["data"][0:1].permute(0, 2, 3, 1).contiguous()
         fluent_2 = batch["data"][1:2].permute(0, 2, 3, 1).contiguous()
 
