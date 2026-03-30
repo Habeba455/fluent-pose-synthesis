@@ -1,309 +1,331 @@
-import sys
-import time
-import shutil
-import argparse
-import json
-from pathlib import Path, PosixPath
-from types import SimpleNamespace
-
-import numpy as np
+from typing import Optional
 import torch
-import torch.serialization
-from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
-from pose_format.torch.masked.collator import zero_pad_collator
+import torch.nn as nn
 
-from CAMDM.diffusion.create_diffusion import create_gaussian_diffusion
-from CAMDM.utils.common import fixseed, select_platform
-from CAMDM.utils.logger import Logger
-
-from fluent_pose_synthesis.core.models import SignLanguagePoseDiffusion
-from fluent_pose_synthesis.core.training import PoseTrainingPortal
-from fluent_pose_synthesis.data.load_data import SignLanguagePoseDataset
-from fluent_pose_synthesis.config.option import (
-    add_model_args,
-    add_train_args,
-    add_diffusion_args,
-    config_parse,
-)
-
-torch.serialization.add_safe_globals([
-    SimpleNamespace,
-    PosixPath,
-    np.int64,
-    np.int32,
-    np.float64,
-    np.float32,
-    np.bool_,
-])
-
-_original_torch_load = torch.load
+from CAMDM.network.models import PositionalEncoding, TimestepEmbedder, MotionProcess
 
 
-def patched_torch_load(*args, **kwargs):
-    kwargs.setdefault("weights_only", False)
-    if not torch.cuda.is_available():
-        kwargs.setdefault("map_location", torch.device("cpu"))
-    return _original_torch_load(*args, **kwargs)
+class OutputProcessMLP(nn.Module):
+    """
+    Input:
+        output: [T, B, latent_dim]
+    Output:
+        [B, K, D, T]
+    """
 
+    def __init__(
+        self,
+        input_feats: int,
+        latent_dim: int,
+        njoints: int,
+        nfeats: int,
+        hidden_dim: int = 1024,
+    ):
+        super().__init__()
 
-torch.load = patched_torch_load
+        self.input_feats = input_feats
+        self.latent_dim = latent_dim
+        self.njoints = njoints
+        self.nfeats = nfeats
+        self.hidden_dim = hidden_dim
 
-
-def _to_numpy(x):
-    if isinstance(x, np.ndarray):
-        return x
-    if torch.is_tensor(x):
-        return x.detach().cpu().numpy()
-    return None
-
-
-def _find_pose_feature_dim(obj):
-    candidates = []
-
-    def walk(x, name="root"):
-        arr = _to_numpy(x)
-        if arr is not None:
-            shape = tuple(arr.shape)
-
-            if arr.ndim == 2 and shape[-1] > 0:
-                candidates.append((shape[-1], shape, name))
-
-            elif arr.ndim == 3:
-                if shape[-1] in (2, 3, 4) and shape[-2] > 0:
-                    feat_dim = shape[-2] * shape[-1]
-                    candidates.append((feat_dim, shape, name))
-                elif shape[-1] > 0:
-                    candidates.append((shape[-1], shape, name))
-
-            elif arr.ndim == 4:
-                if shape[-1] in (2, 3, 4) and shape[-2] > 0:
-                    feat_dim = shape[-2] * shape[-1]
-                    candidates.append((feat_dim, shape, name))
-                elif shape[-1] > 0:
-                    candidates.append((shape[-1], shape, name))
-            return
-
-        if isinstance(x, dict):
-            for k, v in x.items():
-                walk(v, f"{name}.{k}")
-        elif isinstance(x, (list, tuple)):
-            for i, v in enumerate(x):
-                walk(v, f"{name}[{i}]")
-
-    walk(obj)
-
-    if not candidates:
-        raise RuntimeError("Could not infer pose feature dimension from dataset sample.")
-
-    candidates.sort(key=lambda z: z[0], reverse=True)
-    return candidates[0]
-
-
-def infer_arch_from_dataset(dataset, logger, default_dims=3):
-    if len(dataset) == 0:
-        raise RuntimeError("Dataset is empty, cannot infer input feature size.")
-
-    sample = dataset[0]
-    feature_dim, original_shape, source_name = _find_pose_feature_dim(sample)
-
-    dims = default_dims
-    if feature_dim % dims != 0:
-        raise RuntimeError(
-            f"Inferred feature dim = {feature_dim} from {source_name} with shape {original_shape}, "
-            f"but it is not divisible by dims={dims}."
+        self.mlp = nn.Sequential(
+            nn.Linear(latent_dim, hidden_dim),
+            nn.SiLU(),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.SiLU(),
+            nn.Linear(hidden_dim // 2, input_feats),
         )
 
-    keypoints = feature_dim // dims
+    def forward(self, output: torch.Tensor) -> torch.Tensor:
+        # output: [T, B, latent_dim]
+        nframes, bs, _ = output.shape
 
-    logger.info(
-        f"[AUTO-INFER] Found pose source: {source_name}, shape={original_shape}, "
-        f"feature_dim={feature_dim}, dims={dims}, keypoints={keypoints}"
-    )
-
-    return keypoints, dims, feature_dim
-
-
-def train(config, resume_path, logger, tb_writer):
-    np_dtype = select_platform(32)
-
-    logger.info("Loading training dataset...")
-
-    train_dataset = SignLanguagePoseDataset(
-        data_dir=config.data,
-        split="train",
-        chunk_len=config.arch.chunk_len,
-        history_len=getattr(config.arch, "history_len", 10),
-        dtype=np_dtype,
-        limited_num=config.trainer.load_num,
-        min_condition_length=10,
-        fixed_condition_length=-1,
-    )
-
-    inferred_keypoints, inferred_dims, inferred_input_feats = infer_arch_from_dataset(
-        train_dataset,
-        logger,
-        default_dims=getattr(config.arch, "dims", 3),
-    )
-
-    logger.info(
-        f"[AUTO-UPDATE] Overriding config.arch.keypoints: "
-        f"{getattr(config.arch, 'keypoints', 'N/A')} -> {inferred_keypoints}"
-    )
-    logger.info(
-        f"[AUTO-UPDATE] Using config.arch.dims: "
-        f"{getattr(config.arch, 'dims', 'N/A')} -> {inferred_dims}"
-    )
-
-    config.arch.keypoints = inferred_keypoints
-    config.arch.dims = inferred_dims
-
-    train_dataloader = DataLoader(
-        train_dataset,
-        batch_size=config.trainer.batch_size,
-        shuffle=True,
-        num_workers=config.trainer.workers,
-        drop_last=False,
-        pin_memory=torch.cuda.is_available(),
-        collate_fn=zero_pad_collator,
-    )
-
-    logger.info(
-        f"Training Dataset includes {len(train_dataset)} samples "
-        f"with {config.arch.chunk_len} frames each."
-    )
-
-    logger.info("Loading validation dataset...")
-
-    validation_dataset = SignLanguagePoseDataset(
-        data_dir=config.data,
-        split="val",
-        chunk_len=config.arch.chunk_len,
-        history_len=getattr(config.arch, "history_len", 10),
-        dtype=np_dtype,
-        limited_num=config.trainer.load_num,
-        min_condition_length=10,
-        fixed_condition_length=-1,
-    )
-
-    validation_dataloader = DataLoader(
-        validation_dataset,
-        batch_size=1,
-        shuffle=False,
-        num_workers=config.trainer.workers,
-        drop_last=False,
-        pin_memory=torch.cuda.is_available(),
-        collate_fn=zero_pad_collator,
-    )
-
-    logger.info(f"Validation Dataset includes {len(validation_dataset)} samples.")
-
-    diffusion = create_gaussian_diffusion(config)
-
-    input_feats = inferred_input_feats
-
-    logger.info(
-        f"[MODEL INPUT] keypoints={config.arch.keypoints}, "
-        f"dims={config.arch.dims}, input_feats={input_feats}"
-    )
-
-    model = SignLanguagePoseDiffusion(
-        input_feats=input_feats,
-        chunk_len=config.arch.chunk_len,
-        keypoints=config.arch.keypoints,
-        dims=config.arch.dims,
-        latent_dim=config.arch.latent_dim,
-        ff_size=config.arch.ff_size,
-        num_layers=config.arch.num_layers,
-        num_heads=config.arch.num_heads,
-        dropout=getattr(config.arch, "dropout", 0.2),
-        ablation=getattr(config.arch, "ablation", None),
-        activation=getattr(config.arch, "activation", "gelu"),
-        legacy=getattr(config.arch, "legacy", False),
-        arch=config.arch.decoder,
-        cond_mask_prob=config.trainer.cond_mask_prob,
-        device=config.device,
-    ).to(config.device)
-
-    logger.info("Model created successfully")
-
-    trainer = PoseTrainingPortal(
-        config,
-        model,
-        diffusion,
-        train_dataloader,
-        logger,
-        tb_writer,
-        validation_dataloader=validation_dataloader,
-    )
-
-    if resume_path is not None:
-        try:
-            trainer.load_checkpoint(str(resume_path))
-        except FileNotFoundError:
-            print(f"No checkpoint found at {resume_path}")
-            sys.exit(1)
-
-    profiler_dir = config.save / "profiler_logs"
-    profiler_dir.mkdir(parents=True, exist_ok=True)
-
-    logger.info("Starting training loop...")
-
-    trainer.run_loop(
-        enable_profiler=False,
-        profiler_directory=str(profiler_dir),
-    )
+        output = self.mlp(output)  # [T, B, input_feats]
+        output = output.reshape(nframes, bs, self.njoints, self.nfeats)  # [T, B, K, D]
+        output = output.permute(1, 2, 3, 0).contiguous()  # [B, K, D, T]
+        return output
 
 
-def main():
-    start_time = time.time()
+class SignLanguagePoseDiffusion(nn.Module):
+    """
+    Corrected diffusion denoiser for sign language pose generation.
 
-    parser = argparse.ArgumentParser()
+    Expected tensor shapes:
+        fluent_clip (x_t):      [B, K, D, T_chunk]
+        disfluent_seq:          [B, K, D, T_cond]
+        previous_output:        [B, K, D, T_hist] or None
+        t:                      [B]
 
-    parser.add_argument("-n", "--name", default="debug")
-    parser.add_argument("-c", "--config", default="./fluent_pose_synthesis/config/default.json")
-    parser.add_argument("-i", "--data", default="../dataset")
-    parser.add_argument("-r", "--resume", default=None)
-    parser.add_argument("-s", "--save", default="save")
-    parser.add_argument("--seed", type=int, default=1024)
+    Important:
+    - fluent_clip is the current noisy sample x_t and MUST be used.
+    - disfluent_seq is the condition sequence.
+    - previous_output is optional history condition.
+    - We do NOT leak clean target as condition.
+    """
 
-    add_model_args(parser)
-    add_diffusion_args(parser)
-    add_train_args(parser)
+    def __init__(
+        self,
+        input_feats: int,
+        chunk_len: int,
+        keypoints: int,
+        dims: int,
+        latent_dim: int = 256,
+        ff_size: int = 1024,
+        num_layers: int = 8,
+        num_heads: int = 4,
+        dropout: float = 0.2,
+        ablation: Optional[str] = None,
+        activation: str = "gelu",
+        legacy: bool = False,
+        arch: str = "trans_enc",
+        cond_mask_prob: float = 0.0,
+        device: Optional[torch.device] = None,
+        batch_first: bool = True,
+    ):
+        super().__init__()
 
-    args = parser.parse_args()
+        self.input_feats = input_feats
+        self.chunk_len = chunk_len
+        self.keypoints = keypoints
+        self.dims = dims
+        self.latent_dim = latent_dim
+        self.ff_size = ff_size
+        self.num_layers = num_layers
+        self.num_heads = num_heads
+        self.dropout = dropout
+        self.ablation = ablation
+        self.activation = activation
+        self.legacy = legacy
+        self.arch = arch
+        self.cond_mask_prob = cond_mask_prob
+        self.device = device
+        self.batch_first = batch_first
 
-    fixseed(args.seed)
+        self.sequence_pos_encoder = PositionalEncoding(
+            d_model=latent_dim,
+            dropout=dropout,
+        )
 
-    config = config_parse(args)
+        self.embed_timestep = TimestepEmbedder(
+            latent_dim,
+            self.sequence_pos_encoder,
+        )
 
-    config.data = Path(config.data)
-    config.save = Path(config.save)
+        # Separate encoders for clarity
+        self.noisy_encoder = MotionProcess(input_feats, latent_dim)       # x_t
+        self.disfluent_encoder = MotionProcess(input_feats, latent_dim)   # condition
+        self.history_encoder = MotionProcess(input_feats, latent_dim)     # history
 
-    if "debug" in args.name:
-        config.trainer.workers = 1
-        config.trainer.load_num = -1
-        config.trainer.batch_size = 16
-        config.trainer.epoch = 300
+        if self.arch == "trans_enc":
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=latent_dim,
+                nhead=num_heads,
+                dim_feedforward=ff_size,
+                dropout=dropout,
+                activation=activation,
+                batch_first=batch_first,
+            )
+            self.sequence_encoder = nn.TransformerEncoder(
+                encoder_layer,
+                num_layers=num_layers,
+            )
 
-    resume_path = Path(args.resume) if args.resume else None
+        elif self.arch == "trans_dec":
+            decoder_layer = nn.TransformerDecoderLayer(
+                d_model=latent_dim,
+                nhead=num_heads,
+                dim_feedforward=ff_size,
+                dropout=dropout,
+                activation=activation,
+                batch_first=batch_first,
+            )
+            self.sequence_encoder = nn.TransformerDecoder(
+                decoder_layer,
+                num_layers=num_layers,
+            )
 
-    config.save.mkdir(parents=True, exist_ok=True)
+        elif self.arch == "gru":
+            self.sequence_encoder = nn.GRU(
+                latent_dim,
+                latent_dim,
+                num_layers=num_layers,
+                batch_first=True,
+            )
 
-    logger = Logger(config.save / "log.txt")
-    tb_writer = SummaryWriter(log_dir=config.save / "runtime")
+        else:
+            raise ValueError("arch must be one of: ['trans_enc', 'trans_dec', 'gru']")
 
-    if torch.cuda.is_available():
-        config.device = torch.device("cuda")
-    else:
-        config.device = torch.device("cpu")
+        self.fusion_proj = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim),
+            nn.SiLU(),
+            nn.Linear(latent_dim, latent_dim),
+        )
 
-    logger.info(f"\nLaunching training with config:\n{config}")
+        self.pose_projection = OutputProcessMLP(
+            input_feats=input_feats,
+            latent_dim=latent_dim,
+            njoints=keypoints,
+            nfeats=dims,
+            hidden_dim=1024,
+        )
 
-    train(config, resume_path, logger, tb_writer)
+        if self.device is not None:
+            self.to(self.device)
 
-    logger.info(f"\nTotal training time: {(time.time() - start_time) / 60:.2f} mins")
+    def _encode_sequence(self, encoder: nn.Module, x: torch.Tensor) -> torch.Tensor:
+        """
+        Input:
+            x: [B, K, D, T]
+        Output:
+            if batch_first=True  -> [B, T, latent_dim]
+            else                 -> [T, B, latent_dim]
 
+        Assumes MotionProcess returns [T, B, latent_dim].
+        """
+        x_raw = encoder(x)
 
-if __name__ == "__main__":
-    main()
+        if x_raw.dim() != 3:
+            raise ValueError(f"Unexpected encoder output shape: {x_raw.shape}")
+
+        if self.batch_first:
+            return x_raw.permute(1, 0, 2).contiguous()  # [B, T, D]
+        return x_raw.contiguous()  # [T, B, D]
+
+    def forward(
+        self,
+        fluent_clip: torch.Tensor,
+        disfluent_seq: torch.Tensor,
+        t: torch.Tensor,
+        previous_output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        fluent_clip = x_t noisy target
+        """
+        if self.device is not None:
+            fluent_clip = fluent_clip.to(self.device)
+            disfluent_seq = disfluent_seq.to(self.device)
+            t = t.to(self.device)
+            if previous_output is not None:
+                previous_output = previous_output.to(self.device)
+
+        # noisy target chunk length
+        T_chunk = fluent_clip.shape[-1]
+
+        # timestep embedding
+        t_emb_raw = self.embed_timestep(t)
+        # expected either [1, B, D] or [B, D]
+        if t_emb_raw.dim() == 2:
+            t_emb_raw = t_emb_raw.unsqueeze(0)  # [1, B, D]
+
+        if self.batch_first:
+            t_emb = t_emb_raw.permute(1, 0, 2).contiguous()  # [B, 1, D]
+        else:
+            t_emb = t_emb_raw.contiguous()  # [1, B, D]
+
+        # === IMPORTANT FIX ===
+        # Encode x_t itself
+        noisy_emb = self._encode_sequence(self.noisy_encoder, fluent_clip)         # [B,T,D] or [T,B,D]
+        disfluent_emb = self._encode_sequence(self.disfluent_encoder, disfluent_seq)
+
+        tokens = [t_emb, disfluent_emb]
+
+        if previous_output is not None and previous_output.shape[-1] > 0:
+            prev_emb = self._encode_sequence(self.history_encoder, previous_output)
+            tokens.append(prev_emb)
+
+        if self.arch == "trans_dec":
+            # decoder mode:
+            #   tgt = noisy tokens
+            #   memory = condition tokens
+            if self.batch_first:
+                memory = torch.cat(tokens, dim=1)  # [B, T_cond_total, D]
+                memory = self.sequence_pos_encoder(memory)
+
+                tgt = self.sequence_pos_encoder(noisy_emb)  # [B, T_chunk, D]
+                x_encoded = self.sequence_encoder(tgt=tgt, memory=memory)  # [B, T_chunk, D]
+
+                x_target = self.fusion_proj(x_encoded)
+                x_out = x_target.permute(1, 0, 2).contiguous()  # [T, B, D]
+
+            else:
+                memory = torch.cat(tokens, dim=0)  # [T_cond_total, B, D]
+                memory = self.sequence_pos_encoder(memory)
+
+                tgt = self.sequence_pos_encoder(noisy_emb)  # [T_chunk, B, D]
+                x_encoded = self.sequence_encoder(tgt=tgt, memory=memory)
+
+                x_target = self.fusion_proj(x_encoded)
+                x_out = x_target
+
+        else:
+            # encoder / gru mode:
+            # concatenate noisy tokens with condition tokens
+            if self.batch_first:
+                cond_tokens = torch.cat(tokens, dim=1)              # [B, T_cond_total, D]
+                xseq = torch.cat([noisy_emb, cond_tokens], dim=1)   # [B, T_total, D]
+                xseq = self.sequence_pos_encoder(xseq)
+
+                if self.arch == "trans_enc":
+                    x_encoded = self.sequence_encoder(xseq)
+                elif self.arch == "gru":
+                    x_encoded, _ = self.sequence_encoder(xseq)
+                else:
+                    raise ValueError("Unsupported architecture")
+
+                # first T_chunk tokens correspond to x_t path
+                x_target = x_encoded[:, :T_chunk, :]                # [B, T_chunk, D]
+                x_target = self.fusion_proj(x_target)
+                x_out = x_target.permute(1, 0, 2).contiguous()      # [T, B, D]
+
+            else:
+                cond_tokens = torch.cat(tokens, dim=0)              # [T_cond_total, B, D]
+                xseq = torch.cat([noisy_emb, cond_tokens], dim=0)   # [T_total, B, D]
+                xseq = self.sequence_pos_encoder(xseq)
+
+                if self.arch == "trans_enc":
+                    x_encoded = self.sequence_encoder(xseq)
+                elif self.arch == "gru":
+                    x_encoded, _ = self.sequence_encoder(xseq)
+                else:
+                    raise ValueError("Unsupported architecture")
+
+                x_target = x_encoded[:T_chunk, :, :]                # [T_chunk, B, D]
+                x_target = self.fusion_proj(x_target)
+                x_out = x_target
+
+        output = self.pose_projection(x_out)  # [B, K, D, T]
+        return output
+
+    def interface(
+        self,
+        fluent_clip: torch.Tensor,
+        t: torch.Tensor,
+        y: dict[str, torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        fluent_clip هنا هو x_t من diffusion process
+        """
+        batch_size = fluent_clip.size(0)
+
+        disfluent_seq = y["input_sequence"]
+        previous_output = y.get("previous_output", None)
+
+        # CFG masking only on conditioning paths
+        if self.cond_mask_prob > 0:
+            keep = (
+                torch.rand(batch_size, device=disfluent_seq.device)
+                < (1 - self.cond_mask_prob)
+            ).float().view(batch_size, 1, 1, 1)
+
+            disfluent_seq = disfluent_seq * keep
+
+            if previous_output is not None:
+                previous_output = previous_output * keep
+
+        return self.forward(
+            fluent_clip=fluent_clip,
+            disfluent_seq=disfluent_seq,
+            t=t,
+            previous_output=previous_output,
+        )
