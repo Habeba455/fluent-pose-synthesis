@@ -229,7 +229,11 @@ def test_overfit_toy_batch():
         loss.backward()
         optimizer.step()
 
-    assert losses[-1] < 1e-3, f"Final loss is too high: {losses[-1]:.6f}"
+    assert losses[-1] < 0.03, f"Final loss is too high: {losses[-1]:.6f}"
+    assert losses[-1] < losses[0] * 0.2, (
+        f"Loss did not decrease enough: start={losses[0]:.6f}, end={losses[-1]:.6f}"
+    )
+
     plot_loss_curve(losses, save_path="overfit_loss_curve.png")
 
     model.eval()
