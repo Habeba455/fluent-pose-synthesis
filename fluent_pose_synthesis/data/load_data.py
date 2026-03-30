@@ -5,7 +5,6 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 from tqdm import tqdm
-
 from pose_format import Pose
 
 
@@ -38,13 +37,15 @@ class SignLanguagePoseDataset(Dataset):
         limited_num: int = -1,
         min_condition_length: int = 0,
         fixed_condition_length: int = -1,
+        updated_suffix: str = "_updated_clean.pose",   # الجديد
     ):
-        self.data_dir = data_dir
+        self.data_dir = Path(data_dir)
         self.split = split
         self.chunk_len = chunk_len
         self.history_len = history_len
         self.window_len = chunk_len + history_len
         self.dtype = dtype
+        self.updated_suffix = updated_suffix
 
         self.pose_header = None
         self.keypoints = None
@@ -57,11 +58,11 @@ class SignLanguagePoseDataset(Dataset):
         if limited_num > 0:
             fluent_files = fluent_files[:limited_num]
 
-        print(f"Found {len(fluent_files)} pose files")
+        print(f"Found {len(fluent_files)} original pose files in {split_dir}")
 
         for fluent_file in tqdm(fluent_files, desc=f"Loading {split} examples"):
             disfluent_file = fluent_file.with_name(
-                fluent_file.name.replace("_original.pose", "_updated.pose")
+                fluent_file.name.replace("_original.pose", updated_suffix)
             )
             metadata_file = fluent_file.with_name(
                 fluent_file.name.replace("_original.pose", "_metadata.json")
@@ -85,6 +86,7 @@ class SignLanguagePoseDataset(Dataset):
 
         self.fluent_clip_list = []
         self.disfluent_clip_list = []
+        self.metadata_list = []
 
         for example in tqdm(self.examples, desc="Processing pose files"):
             try:
@@ -94,12 +96,16 @@ class SignLanguagePoseDataset(Dataset):
                 with open(example["disfluent_path"], "rb") as f:
                     disfluent_pose = Pose.read(f.read())
 
+                with open(example["metadata_path"], "r", encoding="utf-8") as f:
+                    metadata = json.load(f)
+
                 if self.pose_header is None:
                     self.pose_header = fluent_pose.header
 
                 fluent_data = np.asarray(fluent_pose.body.data.astype(self.dtype))
                 disfluent_data = np.asarray(disfluent_pose.body.data.astype(self.dtype))
 
+                # expected shape: (T, 1, K, D)
                 fluent_seq = fluent_data[:, 0]
                 disfluent_seq = disfluent_data[:, 0]
 
@@ -116,12 +122,15 @@ class SignLanguagePoseDataset(Dataset):
                     self.keypoints = kf
                     self.dims = df
 
+                # مهم: خلي condition مساوية لطول target
                 disfluent_seq = resample_sequence(disfluent_seq, tf)
 
                 self.fluent_clip_list.append(fluent_seq.astype(self.dtype))
                 self.disfluent_clip_list.append(disfluent_seq.astype(self.dtype))
+                self.metadata_list.append(metadata)
 
-            except Exception:
+            except Exception as e:
+                print(f"Skipping {example['fluent_path'].name}: {e}")
                 continue
 
         if len(self.fluent_clip_list) == 0:
@@ -179,9 +188,13 @@ class SignLanguagePoseDataset(Dataset):
         target_seq = full_seq[history_len:]
 
         return {
-            "data": target_seq,
+            "data": target_seq,   # target = original
             "conditions": {
-                "input_sequence": disfluent_seq,
+                "input_sequence": disfluent_seq,      # input = updated_clean
                 "previous_output": previous_output,
             },
+            "meta": self.metadata_list[motion_idx],
+            "motion_idx": motion_idx,
+            "start": start,
+            "end": end,
         }
