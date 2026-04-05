@@ -37,7 +37,7 @@ class SignLanguagePoseDataset(Dataset):
         limited_num: int = -1,
         min_condition_length: int = 0,
         fixed_condition_length: int = -1,
-        updated_suffix: str = "_updated_clean.pose",   # الجديد
+        updated_suffix: str = "_updated_local_fix_2.pose",
     ):
         self.data_dir = Path(data_dir)
         self.split = split
@@ -70,7 +70,6 @@ class SignLanguagePoseDataset(Dataset):
 
             if not disfluent_file.exists():
                 continue
-
             if not metadata_file.exists():
                 continue
 
@@ -105,7 +104,6 @@ class SignLanguagePoseDataset(Dataset):
                 fluent_data = np.asarray(fluent_pose.body.data.astype(self.dtype))
                 disfluent_data = np.asarray(disfluent_pose.body.data.astype(self.dtype))
 
-                # expected shape: (T, 1, K, D)
                 fluent_seq = fluent_data[:, 0]
                 disfluent_seq = disfluent_data[:, 0]
 
@@ -122,7 +120,6 @@ class SignLanguagePoseDataset(Dataset):
                     self.keypoints = kf
                     self.dims = df
 
-                # مهم: خلي condition مساوية لطول target
                 disfluent_seq = resample_sequence(disfluent_seq, tf)
 
                 self.fluent_clip_list.append(fluent_seq.astype(self.dtype))
@@ -182,18 +179,16 @@ class SignLanguagePoseDataset(Dataset):
         full_seq = torch.from_numpy(full_seq.astype(np.float32))
         disfluent_seq = torch.from_numpy(disfluent_seq.astype(np.float32))
 
-        history_len = self.history_len
-
-        previous_output = full_seq[:history_len]
-        target_seq = full_seq[history_len:]
+        previous_output = full_seq[:self.history_len]
+        target_seq = full_seq[self.history_len:]
 
         return {
-            "data": target_seq,   # target = original
+            "data": target_seq,
             "conditions": {
-                "input_sequence": disfluent_seq,      # input = updated_clean
+                "input_sequence": disfluent_seq,
                 "previous_output": previous_output,
             },
-            "meta": self.metadata_list[motion_idx],
+            "metadata": self.metadata_list[motion_idx],
             "motion_idx": motion_idx,
             "start": start,
             "end": end,
