@@ -33,7 +33,7 @@ from CAMDM.utils.common import mkdir
 
 
 class _ConditionalWrapper(nn.Module):
-    """Wraps a base model and a fixed conditioning dict, forwarding only (x, t)."""
+    """Wrap a model with a fixed conditioning dict, exposing forward(x, t)."""
 
     def __init__(self, base_model: nn.Module, cond: dict):
         super().__init__()
@@ -56,24 +56,23 @@ def masked_l2_per_sample(
     x: Tensor,
     y: Tensor,
     mask: Optional[Tensor] = None,
-    reduce: bool = True
+    reduce: bool = True,
 ) -> Tensor:
     """
-    x, y shape: (B, K, D, T)
-    mask shape: (B, K, D, T), True = masked/invalid, False = valid
+    x, y   : [B, K, D, T]
+    mask   : [B, K, D, T], True = invalid/masked
     """
     diff_sq = (x - y) ** 2
 
     if mask is not None:
-        mask = mask.bool()
-        valid_mask_elements = (~mask).float()
-        diff_sq = diff_sq * valid_mask_elements
+        valid = (~mask.bool()).float()
+        diff_sq = diff_sq * valid
     else:
-        valid_mask_elements = torch.ones_like(diff_sq)
+        valid = torch.ones_like(diff_sq)
 
-    per_sample_loss_sum = diff_sq.flatten(start_dim=1).sum(dim=1)
-    valid_elements_count = valid_mask_elements.flatten(start_dim=1).sum(dim=1)
-    per_sample_loss = per_sample_loss_sum / valid_elements_count.clamp(min=1)
+    per_sample_sum = diff_sq.flatten(start_dim=1).sum(dim=1)
+    valid_count = valid.flatten(start_dim=1).sum(dim=1).clamp(min=1)
+    per_sample_loss = per_sample_sum / valid_count
 
     if reduce:
         return per_sample_loss.mean()
@@ -82,15 +81,15 @@ def masked_l2_per_sample(
 
 class PoseTrainingPortal(BaseTrainingPortal):
     """
-    Corrected training portal for pose diffusion.
-    Assumes:
-      - dataloader returns x_start in shape (B, T, K, D)
-      - conditions["input_sequence"] in shape (B, T_cond, K, D)
-      - conditions["previous_output"] in shape (B, T_hist, K, D)
-      - model.interface(x_t, t, cond) expects:
-            x_t: (B, K, D, T)
-            input_sequence: (B, K, D, T_cond)
-            previous_output: (B, K, D, T_hist)
+    Expected dataloader output:
+      - batch["data"] -> [B, T_chunk, K, D]
+      - batch["conditions"]["input_sequence"] -> [B, T_cond, K, D]
+      - batch["conditions"]["previous_output"] -> [B, T_hist, K, D]
+
+    Model interface expects:
+      - x_t -> [B, K, D, T_chunk]
+      - input_sequence -> [B, K, D, T_cond]
+      - previous_output -> [B, K, D, T_hist]
     """
 
     def __init__(
@@ -111,22 +110,8 @@ class PoseTrainingPortal(BaseTrainingPortal):
         self.validation_dataloader = validation_dataloader
         self.best_validation_metric = float("inf")
 
-        if HAS_POSE_EVAL:
-            self.validation_metric_calculator = DistanceMetric(
-                name="Validation DTW",
-                distance_measure=DTWDTAIImplementationDistanceMeasure(
-                    name="dtaiDTW",
-                    use_fast=True,
-                    default_distance=0.0,
-                ),
-                pose_preprocessors=[NormalizePosesProcessor()],
-            )
-            if self.logger:
-                self.logger.info("Initialized DTW validation metric")
-        else:
-            self.validation_metric_calculator = None
-            if self.logger:
-                self.logger.info("pose_evaluation not installed; DTW validation disabled")
+        if not hasattr(dataloader.dataset, "input_mean") or not hasattr(dataloader.dataset, "input_std"):
+            raise AttributeError("Training dataset must expose input_mean and input_std")
 
         self.train_input_mean = torch.tensor(
             dataloader.dataset.input_mean,
@@ -146,6 +131,23 @@ class PoseTrainingPortal(BaseTrainingPortal):
             if self.val_pose_header is not None and self.logger:
                 self.logger.info("Pose header loaded from validation dataset.")
 
+        if HAS_POSE_EVAL:
+            self.validation_metric_calculator = DistanceMetric(
+                name="Validation DTW",
+                distance_measure=DTWDTAIImplementationDistanceMeasure(
+                    name="dtaiDTW",
+                    use_fast=True,
+                    default_distance=0.0,
+                ),
+                pose_preprocessors=[NormalizePosesProcessor()],
+            )
+            if self.logger:
+                self.logger.info("Initialized DTW validation metric")
+        else:
+            self.validation_metric_calculator = None
+            if self.logger:
+                self.logger.info("pose_evaluation not installed; DTW validation disabled")
+
     def diffuse(
         self,
         x_start: Tensor,
@@ -155,43 +157,46 @@ class PoseTrainingPortal(BaseTrainingPortal):
         return_loss: bool = False,
     ) -> Tuple[Tensor, Optional[Dict[str, Tensor]]]:
         """
-        x_start shape from loader: (B, T_chunk, K, D)
-        cond["input_sequence"]: (B, T_cond, K, D)
-        cond["previous_output"]: (B, T_hist, K, D)
+        x_start from loader: [B, T_chunk, K, D]
+        cond["input_sequence"]: [B, T_cond, K, D]
+        cond["previous_output"]: [B, T_hist, K, D]
         """
-        x_start = x_start.permute(0, 2, 3, 1).contiguous().to(self.device)
+        x_start = x_start.permute(0, 2, 3, 1).contiguous().to(self.device)  # [B, K, D, T]
 
         if noise is None:
             noise = torch.randn_like(x_start)
 
-        x_t = self.diffusion.q_sample(x_start, t.to(self.device), noise=noise)
+        t_device = t.to(self.device)
+        x_t = self.diffusion.q_sample(x_start, t_device, noise=noise)
 
         processed_cond = {}
         for key, val in cond.items():
             processed_cond[key] = move_to_device(val, self.device)
 
-        if "input_sequence" in processed_cond:
-            processed_cond["input_sequence"] = processed_cond["input_sequence"].permute(0, 2, 3, 1).contiguous()
+        if "input_sequence" not in processed_cond:
+            raise KeyError("conditions must contain 'input_sequence'")
+
+        processed_cond["input_sequence"] = processed_cond["input_sequence"].permute(0, 2, 3, 1).contiguous()
 
         if "previous_output" in processed_cond and processed_cond["previous_output"] is not None:
             processed_cond["previous_output"] = processed_cond["previous_output"].permute(0, 2, 3, 1).contiguous()
 
         model_output = self.model.interface(
             x_t,
-            self.diffusion._scale_timesteps(t.to(self.device)),
+            self.diffusion._scale_timesteps(t_device),
             processed_cond,
-        )
+        )  # [B, K, D, T]
 
-        model_output_original_shape = model_output.permute(0, 3, 1, 2).contiguous()
+        model_output_loader_shape = model_output.permute(0, 3, 1, 2).contiguous()  # [B, T, K, D]
 
         if not return_loss:
-            return model_output_original_shape, None
+            return model_output_loader_shape, None
 
         loss_terms = {}
 
         mmt = self.diffusion.model_mean_type
         if mmt.name == "PREVIOUS_X":
-            target = self.diffusion.q_posterior_mean_variance(x_start=x_start, x_t=x_t, t=t)[0]
+            target = self.diffusion.q_posterior_mean_variance(x_start=x_start, x_t=x_t, t=t_device)[0]
         elif mmt.name == "START_X":
             target = x_start
         elif mmt.name == "EPSILON":
@@ -199,10 +204,11 @@ class PoseTrainingPortal(BaseTrainingPortal):
         else:
             raise ValueError(f"Unsupported model_mean_type: {mmt}")
 
-        assert model_output.shape == target.shape == x_start.shape, (
-            f"Shape mismatch: model_output={model_output.shape}, "
-            f"target={target.shape}, x_start={x_start.shape}"
-        )
+        if model_output.shape != target.shape or model_output.shape != x_start.shape:
+            raise ValueError(
+                f"Shape mismatch: model_output={tuple(model_output.shape)}, "
+                f"target={tuple(target.shape)}, x_start={tuple(x_start.shape)}"
+            )
 
         mask_from_loader = processed_cond.get("target_mask", None)
         if mask_from_loader is not None:
@@ -210,44 +216,30 @@ class PoseTrainingPortal(BaseTrainingPortal):
         else:
             mask = torch.zeros_like(x_start, dtype=torch.bool)
 
-        batch_has_valid = (
-            mask.float().sum(dim=(1, 2, 3))
-            < mask.shape[1] * mask.shape[2] * mask.shape[3]
-        )
-
-        valid_batch_indices = batch_has_valid.nonzero(as_tuple=False).squeeze()
-
-        if valid_batch_indices.numel() == 0:
-            zero_loss = torch.tensor(0.0, device=self.device, requires_grad=False)
-            loss_terms = {
-                "loss": zero_loss,
-                "loss_data": zero_loss,
-                "loss_data_vel": zero_loss,
-            }
-            return model_output_original_shape, loss_terms
-
         if getattr(self.config.trainer, "use_loss_mse", True):
-            loss_data = masked_l2_per_sample(target, model_output, mask, reduce=True)
-            loss_terms["loss_data"] = loss_data
+            loss_terms["loss_data"] = masked_l2_per_sample(target, model_output, mask, reduce=True)
 
         if getattr(self.config.trainer, "use_loss_vel", True):
             target_vel = target[..., 1:] - target[..., :-1]
             model_output_vel = model_output[..., 1:] - model_output[..., :-1]
             mask_vel = mask[..., 1:] if mask is not None else None
-            loss_data_vel = masked_l2_per_sample(target_vel, model_output_vel, mask_vel, reduce=True)
-            loss_terms["loss_data_vel"] = loss_data_vel
+            loss_terms["loss_data_vel"] = masked_l2_per_sample(
+                target_vel,
+                model_output_vel,
+                mask_vel,
+                reduce=True,
+            )
 
             if getattr(self.config.trainer, "use_loss_accel", False):
                 target_accel = target_vel[..., 1:] - target_vel[..., :-1]
                 model_output_accel = model_output_vel[..., 1:] - model_output_vel[..., :-1]
                 mask_accel = mask_vel[..., 1:] if mask_vel is not None else None
-                loss_data_accel = masked_l2_per_sample(
+                loss_terms["loss_data_accel"] = masked_l2_per_sample(
                     target_accel,
                     model_output_accel,
                     mask_accel,
                     reduce=True,
                 )
-                loss_terms["loss_data_accel"] = loss_data_accel
 
         total_loss = torch.tensor(0.0, device=self.device)
 
@@ -264,7 +256,7 @@ class PoseTrainingPortal(BaseTrainingPortal):
 
         loss_terms["loss"] = total_loss
 
-        return model_output_original_shape, loss_terms
+        return model_output_loader_shape, loss_terms
 
     def _compute_dtw_score(self, predictions: List[Pose], references: List[Pose]) -> float:
         if self.validation_metric_calculator is None:
@@ -292,10 +284,6 @@ class PoseTrainingPortal(BaseTrainingPortal):
         previous_output_bkdt: Tensor,
         target_shape: Tuple[int, int, int, int],
     ) -> Tensor:
-        """
-        target_shape: (B, K, D, T_chunk)
-        returns sampled chunk in (B, K, D, T_chunk)
-        """
         guidance_scale = getattr(self.config.trainer, "guidance_scale", 2.0)
 
         cond_dict = {
@@ -334,54 +322,52 @@ class PoseTrainingPortal(BaseTrainingPortal):
         batch_idx: int,
     ) -> Tuple[List[Pose], List[Pose]]:
         """
-        Validation on chunk-level samples.
-        We generate one chunk with the same length as GT target.
+        Chunk-level validation.
         """
         with torch.no_grad():
-            gt_fluent_full_loader = batch_data["data"].to(self.device)
-            disfluent_cond_seq_loader = batch_data["conditions"]["input_sequence"].to(self.device)
-            initial_history_loader = batch_data["conditions"]["previous_output"].to(self.device)
+            gt_loader = batch_data["data"].to(self.device)  # [B, T, K, D]
+            disfluent_loader = batch_data["conditions"]["input_sequence"].to(self.device)
+            history_loader = batch_data["conditions"]["previous_output"].to(self.device)
 
-            B, T_chunk, K, D_feat = gt_fluent_full_loader.shape
+            B, T_chunk, K, D_feat = gt_loader.shape
 
-            disfluent_cond_seq = disfluent_cond_seq_loader.permute(0, 2, 3, 1).contiguous()
-            current_history = initial_history_loader.permute(0, 2, 3, 1).contiguous()
-
-            target_shape = (B, K, D_feat, T_chunk)
+            disfluent_bkdt = disfluent_loader.permute(0, 2, 3, 1).contiguous()
+            history_bkdt = history_loader.permute(0, 2, 3, 1).contiguous()
 
             pred_bkdt = self._sample_chunk_with_cfg(
-                input_sequence_bkdt=disfluent_cond_seq,
-                previous_output_bkdt=current_history,
-                target_shape=target_shape,
+                input_sequence_bkdt=disfluent_bkdt,
+                previous_output_bkdt=history_bkdt,
+                target_shape=(B, K, D_feat, T_chunk),
             )
 
-            pred_normed = pred_bkdt.permute(0, 3, 1, 2).contiguous()
+            pred_loader = pred_bkdt.permute(0, 3, 1, 2).contiguous()
 
             val_ds = self.validation_dataloader.dataset
+            if not hasattr(val_ds, "input_mean") or not hasattr(val_ds, "input_std"):
+                raise AttributeError("Validation dataset must expose input_mean and input_std")
+
             val_mean = torch.tensor(val_ds.input_mean, device=self.device).view(1, 1, K, D_feat)
             val_std = torch.tensor(val_ds.input_std, device=self.device).view(1, 1, K, D_feat)
 
-            gt_unnorm = gt_fluent_full_loader * val_std + val_mean
-            pred_unnorm = pred_normed * val_std + val_mean
+            gt_unnorm = gt_loader * val_std + val_mean
+            pred_unnorm = pred_loader * val_std + val_mean
 
             refs, preds = [], []
+            fps = getattr(self.val_pose_header, "fps", 25.0) if self.val_pose_header is not None else 25.0
 
             for i in range(B):
-                current_original_length = gt_unnorm[i].shape[0]
-                fps = getattr(self.val_pose_header, "fps", 25.0) if self.val_pose_header is not None else 25.0
+                ref_np = gt_unnorm[i].cpu().numpy().reshape(T_chunk, 1, K, D_feat).astype(np.float64)
+                pred_np = pred_unnorm[i].cpu().numpy().reshape(T_chunk, 1, K, D_feat).astype(np.float64)
 
-                ref_np = gt_unnorm[i].cpu().numpy().reshape(current_original_length, 1, K, D_feat).astype(np.float64)
                 ref_body = NumPyPoseBody(
                     fps=fps,
                     data=ref_np,
-                    confidence=np.ones((current_original_length, 1, K)),
+                    confidence=np.ones((T_chunk, 1, K), dtype=np.float32),
                 )
-
-                pred_np = pred_unnorm[i].cpu().numpy().reshape(current_original_length, 1, K, D_feat).astype(np.float64)
                 pred_body = NumPyPoseBody(
                     fps=fps,
                     data=pred_np,
-                    confidence=np.ones((current_original_length, 1, K)),
+                    confidence=np.ones((T_chunk, 1, K), dtype=np.float32),
                 )
 
                 refs.append(Pose(self.val_pose_header, ref_body))
@@ -442,14 +428,13 @@ class PoseTrainingPortal(BaseTrainingPortal):
             collate_fn=zero_pad_collator,
         )
 
-        # disabled for fast CPU training
-        # self.evaluate_sampling(sampling_subset, save_folder_name="init_samples")
-
         if self.validation_dataloader is not None:
             num_to_save = getattr(self.config.trainer, "validation_save_num", 30)
             val_dataset = self.validation_dataloader.dataset
             if len(val_dataset) > num_to_save:
-                self.validation_sample_indices = np.random.choice(len(val_dataset), num_to_save, replace=False).tolist()
+                self.validation_sample_indices = np.random.choice(
+                    len(val_dataset), num_to_save, replace=False
+                ).tolist()
             else:
                 self.validation_sample_indices = list(range(len(val_dataset)))
         else:
@@ -465,7 +450,7 @@ class PoseTrainingPortal(BaseTrainingPortal):
 
             data_len = len(self.dataloader)
 
-            for step, datas in enumerate(tqdm(self.dataloader, desc=f"Epoch {epoch_idx}")):
+            for _, datas in enumerate(tqdm(self.dataloader, desc=f"Epoch {epoch_idx}")):
                 datas = {key: val.to(self.device) if torch.is_tensor(val) else val for key, val in datas.items()}
                 cond = {
                     key: val.to(self.device) if torch.is_tensor(val) else val
@@ -495,11 +480,9 @@ class PoseTrainingPortal(BaseTrainingPortal):
                 if self.config.trainer.ema:
                     self.ema.update()
 
-                for key_name in losses.keys():
+                for key_name, val in losses.items():
                     if "loss" in key_name:
-                        if key_name not in epoch_losses:
-                            epoch_losses[key_name] = []
-                        epoch_losses[key_name].append(losses[key_name].mean().item())
+                        epoch_losses.setdefault(key_name, []).append(val.mean().item())
 
             if profiler:
                 profiler.stop()
@@ -533,11 +516,9 @@ class PoseTrainingPortal(BaseTrainingPortal):
                         total_loss.backward()
                         self.opt.step()
 
-                    for key_name in prior_losses.keys():
+                    for key_name, val in prior_losses.items():
                         if "loss" in key_name:
-                            if key_name not in epoch_losses:
-                                epoch_losses[key_name] = []
-                            epoch_losses[key_name].append(prior_losses[key_name].mean().item())
+                            epoch_losses.setdefault(key_name, []).append(val.mean().item())
 
             avg_loss_data = np.mean(epoch_losses["loss_data"]) if "loss_data" in epoch_losses else 0.0
             avg_loss_vel = np.mean(epoch_losses["loss_data_vel"]) if "loss_data_vel" in epoch_losses else 0.0
@@ -571,13 +552,11 @@ class PoseTrainingPortal(BaseTrainingPortal):
             save_freq = max(1, int(getattr(self.config.trainer, "save_freq", 1)))
             if epoch_idx > 0 and epoch_idx % save_freq == 0:
                 self.save_checkpoint(filename=f"weights_{epoch_idx}")
-                # disabled for fast CPU training
-                # self.evaluate_sampling(sampling_subset, save_folder_name="train_samples")
 
             if self.tb_writer:
-                for key_name in epoch_losses.keys():
+                for key_name, vals in epoch_losses.items():
                     if "loss" in key_name:
-                        self.tb_writer.add_scalar(f"train/{key_name}", np.mean(epoch_losses[key_name]), epoch_idx)
+                        self.tb_writer.add_scalar(f"train/{key_name}", np.mean(vals), epoch_idx)
 
             self.scheduler.step()
 
@@ -671,11 +650,6 @@ class PoseTrainingPortal(BaseTrainingPortal):
                             f"validation GT and predictions to {save_dir}"
                         )
 
-        best_path = f"{self.config.save}/best.pt"
-        # disabled for fast CPU training
-        # self.load_checkpoint(best_path)
-        # self.evaluate_sampling(sampling_subset, save_folder_name="best")
-
     def evaluate_sampling(self, dataloader: DataLoader, save_folder_name: str = "init_samples"):
         """
         Real sampling from diffusion using conditions.
@@ -702,7 +676,7 @@ class PoseTrainingPortal(BaseTrainingPortal):
             return dataset
 
         dataset = get_original_dataset(patched_dataloader.dataset)
-        self.pose_header = dataset.pose_header
+        self.pose_header = getattr(dataset, "pose_header", None)
 
         gt_chunk = datas["data"].to(self.device)
 
@@ -726,6 +700,9 @@ class PoseTrainingPortal(BaseTrainingPortal):
         gt_chunk_array = gt_chunk.cpu().numpy()
         pred_output_array = pred_output_tensor.cpu().numpy()
 
+        if not hasattr(dataset, "input_mean") or not hasattr(dataset, "input_std"):
+            raise AttributeError("Dataset must expose input_mean and input_std")
+
         unnormed_gt = gt_chunk_array * dataset.input_std + dataset.input_mean
         unnormed_pred = pred_output_array * dataset.input_std + dataset.input_mean
 
@@ -746,6 +723,10 @@ class PoseTrainingPortal(BaseTrainingPortal):
         """
         pose_output_np shape: (B, T, K, D)
         """
+        pose_header = self.pose_header if self.pose_header is not None else self.val_pose_header
+        if pose_header is None:
+            raise ValueError("pose_header is required to export .pose files")
+
         for i in range(pose_output_np.shape[0]):
             pose_array = pose_output_np[i]
             time_len, keypoints, dim = pose_array.shape
@@ -754,7 +735,7 @@ class PoseTrainingPortal(BaseTrainingPortal):
             confidence = np.ones((time_len, 1, keypoints), dtype=np.float32)
 
             pose_body = NumPyPoseBody(fps=25, data=pose_array, confidence=confidence)
-            pose_obj = Pose(self.pose_header, pose_body)
+            pose_obj = Pose(pose_header, pose_body)
 
             file_path = f"{save_path}/pose_{i}.{prefix}.pose"
             with open(file_path, "wb") as f:
