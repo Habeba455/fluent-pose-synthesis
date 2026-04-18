@@ -1,7 +1,3 @@
-"""
-PoseGaussianDiffusion — يستبدل create_gaussian_diffusion بتاع CAMDM.
-الفرق الأساسي: بيقرا predict_xstart من الـ config فعلاً (CAMDM كان بيتجاهله).
-"""
 
 from typing import Optional, Dict, Any
 import torch as th
