@@ -1,3 +1,8 @@
+"""
+PoseGaussianDiffusion — يستبدل create_gaussian_diffusion بتاع CAMDM.
+الفرق الأساسي: بيقرا predict_xstart من الـ config فعلاً (CAMDM كان بيتجاهله).
+"""
+
 from typing import Optional, Dict, Any
 import torch as th
 
@@ -8,185 +13,85 @@ from CAMDM.diffusion.gaussian_diffusion import (
     ModelMeanType,
     ModelVarType,
 )
+from CAMDM.diffusion.respace import SpacedDiffusion, space_timesteps
 
 
-class PoseGaussianDiffusion(GaussianDiffusion):
+class PoseGaussianDiffusion(SpacedDiffusion):
+    """
+    SpacedDiffusion (زي اللي بيعمله CAMDM.create_gaussian_diffusion)
+    بس بيحترم predict_xstart اللي في config، مش hard-coded.
+    """
+    pass
 
-    def __init__(self, schedule_kwargs: Dict[str, Any], **kwargs: Any):
 
-        betas = get_named_beta_schedule(**schedule_kwargs)
+def create_pose_gaussian_diffusion(config) -> PoseGaussianDiffusion:
+    """
+    Drop-in replacement for CAMDM's create_gaussian_diffusion.
 
-        super().__init__(
-            betas=betas,
-            model_mean_type=kwargs.get("model_mean_type", ModelMeanType.START_X),
-            model_var_type=kwargs.get("model_var_type", ModelVarType.FIXED_SMALL),
-            loss_type=kwargs.get("loss_type", LossType.MSE),
-            rescale_timesteps=kwargs.get("rescale_timesteps", False),
-            lambda_3d=kwargs.get("lambda_3d", 1.0),
-            lambda_vel=kwargs.get("lambda_vel", 1.0),
-            lambda_r_vel=kwargs.get("lambda_r_vel", 1.0),
-            lambda_pose=kwargs.get("lambda_pose", 1.0),
-            lambda_orient=kwargs.get("lambda_orient", 1.0),
-            lambda_loc=kwargs.get("lambda_loc", 1.0),
-            lambda_root_vel=kwargs.get("lambda_root_vel", 0.0),
-            lambda_vel_rcxyz=kwargs.get("lambda_vel_rcxyz", 0.0),
-            lambda_fc=kwargs.get("lambda_fc", 0.0),
-            data_rep=kwargs.get("data_rep", "rot6d"),
-        )
+    الفرق الأساسي:
+    - CAMDM: predict_xstart = True (hard-coded — بيتجاهل الـ config)
+    - ده  : predict_xstart = getattr(config.diff, "predict_xstart", False)
 
-    def training_losses_pose(
-        self,
-        model: th.nn.Module,
-        pose_target: th.Tensor,
-        t: th.Tensor,
-        config: Any,
-        model_kwargs: Optional[Dict[str, Any]] = None,
-        noise: Optional[th.Tensor] = None,
-    ) -> Dict[str, th.Tensor]:
+    وده اللي بيخلي الموديل يتعلم حركة حقيقية بدلاً من mean pose ثابتة.
+    """
+    # ★ FIX: قراءة من الـ config (default = False عشان epsilon prediction)
+    predict_xstart = getattr(config.diff, "predict_xstart", False)
+    learn_sigma = getattr(config.diff, "learn_sigma", False)
+    rescale_timesteps = getattr(config.diff, "rescale_timesteps", False)
+    timestep_respacing = getattr(config.diff, "timestep_respacing", "")
+    use_kl = getattr(config.diff, "use_kl", False)
+    rescale_learned_sigmas = getattr(config.diff, "rescale_learned_sigmas", False)
 
-        # Ensure noise exists BEFORE q_sample
-        if noise is None:
-            noise = th.randn_like(pose_target)
+    steps = config.diff.diffusion_steps
+    scale_beta = 1.0
 
-        pose_noisy = self.q_sample(pose_target, t, noise=noise)
+    betas = get_named_beta_schedule(config.diff.noise_schedule, steps, scale_beta)
 
-        mask = None
+    # Loss type
+    if use_kl:
+        loss_type = LossType.RESCALED_KL
+    elif rescale_learned_sigmas:
+        loss_type = LossType.RESCALED_MSE
+    else:
+        loss_type = LossType.MSE
 
-        if model_kwargs is not None and "mask" in model_kwargs:
+    if not timestep_respacing:
+        timestep_respacing = [steps]
 
-            mask = model_kwargs["mask"]
+    # Model mean type: EPSILON (predict noise) vs START_X (predict x_0)
+    model_mean_type = (
+        ModelMeanType.EPSILON if not predict_xstart
+        else ModelMeanType.START_X
+    )
 
-            mask = mask.squeeze(2)
+    # Variance type
+    if learn_sigma:
+        model_var_type = ModelVarType.LEARNED_RANGE
+    elif getattr(config.diff, "sigma_small", True):
+        model_var_type = ModelVarType.FIXED_SMALL
+    else:
+        model_var_type = ModelVarType.FIXED_LARGE
 
-            if mask.size(-1) == 3:
-                mask = mask.mean(dim=-1)
+    diffusion = PoseGaussianDiffusion(
+        use_timesteps=space_timesteps(steps, timestep_respacing),
+        betas=betas,
+        model_mean_type=model_mean_type,
+        model_var_type=model_var_type,
+        loss_type=loss_type,
+        rescale_timesteps=rescale_timesteps,
+        lambda_3d=10,
+        lambda_vel=getattr(config.trainer, "lambda_vel", 1),
+        lambda_r_vel=1,
+    )
 
-            if mask.dim() == 3:
-                mask = mask.unsqueeze(-1)
+    print("=" * 60)
+    print("PoseGaussianDiffusion created with:")
+    print(f"  predict_xstart  = {predict_xstart}")
+    print(f"  model_mean_type = {model_mean_type}")
+    print(f"  model_var_type  = {model_var_type}")
+    print(f"  loss_type       = {loss_type}")
+    print(f"  num_timesteps   = {diffusion.num_timesteps}")
+    print(f"  lambda_vel      = {getattr(config.trainer, 'lambda_vel', 1)}")
+    print("=" * 60)
 
-        loss_terms = {}
-
-        if self.loss_type in (LossType.KL, LossType.RESCALED_KL):
-
-            loss_terms["loss"] = self._vb_terms_bpd(
-                model=model,
-                x_start=pose_target,
-                x_t=pose_noisy,
-                t=t,
-                clip_denoised=False,
-                model_kwargs=model_kwargs,
-            )["output"]
-
-            if self.loss_type == LossType.RESCALED_KL:
-                loss_terms["loss"] *= self.num_timesteps
-
-        elif self.loss_type in (LossType.MSE, LossType.RESCALED_MSE):
-
-            model_output = model(
-                pose_noisy,
-                self._scale_timesteps(t),
-                model_kwargs,
-            )
-
-            if self.model_var_type in [
-                ModelVarType.LEARNED,
-                ModelVarType.LEARNED_RANGE,
-            ]:
-
-                batch_size, time = pose_noisy.shape[:2]
-
-                assert model_output.shape == (
-                    batch_size,
-                    time * 2,
-                    *pose_noisy.shape[2:],
-                )
-
-                model_output, model_var_values = th.split(
-                    model_output,
-                    time,
-                    dim=1,
-                )
-
-                frozen_out = th.cat(
-                    [model_output.detach(), model_var_values],
-                    dim=1,
-                )
-
-                loss_terms["vb"] = self._vb_terms_bpd(
-                    model=lambda *args, r=frozen_out: r,
-                    x_start=pose_target,
-                    x_t=pose_noisy,
-                    t=t,
-                    clip_denoised=False,
-                    model_kwargs=model_kwargs,
-                )["output"]
-
-                if self.loss_type == LossType.RESCALED_MSE:
-                    loss_terms["vb"] *= self.num_timesteps / 1000.0
-
-            target = {
-                ModelMeanType.PREVIOUS_X:
-                    self.q_posterior_mean_variance(
-                        x_start=pose_target,
-                        x_t=pose_noisy,
-                        t=t,
-                    )[0],
-
-                ModelMeanType.START_X:
-                    pose_target,
-
-                ModelMeanType.EPSILON:
-                    noise,
-            }[self.model_mean_type]
-
-            assert (
-                model_output.shape == target.shape == pose_target.shape
-            ), f"Shape mismatch: {model_output.shape} vs {target.shape}"
-
-            loss_terms["output"] = model_output
-
-            if config.trainer.use_loss_mse:
-
-                loss_terms["loss_mse"] = self.masked_l2(
-                    model_output,
-                    pose_target,
-                    mask,
-                )
-
-            if config.trainer.use_loss_3d:
-
-                loss_terms["loss_3d"] = self.masked_l2(
-                    model_output,
-                    pose_target,
-                    mask,
-                )
-
-            if config.trainer.use_loss_vel:
-
-                pred_velocity = model_output[:, 1:] - model_output[:, :-1]
-
-                target_velocity = pose_target[:, 1:] - pose_target[:, :-1]
-
-                if mask is not None:
-                    mask_vel = mask[:, 1:]
-                else:
-                    mask_vel = None
-
-                loss_terms["loss_vel"] = self.masked_l2(
-                    pred_velocity,
-                    target_velocity,
-                    mask_vel,
-                )
-
-            loss_terms["loss"] = (
-                loss_terms.get("loss_mse", 0.0)
-                + loss_terms.get("vb", 0.0)
-                + self.lambda_3d * loss_terms.get("loss_3d", 0.0)
-                + self.lambda_vel * loss_terms.get("loss_vel", 0.0)
-            )
-
-        else:
-
-            raise NotImplementedError(self.loss_type)
-
-        return loss_terms
+    return diffusion
