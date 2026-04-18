@@ -7,10 +7,8 @@ from CAMDM.network.models import PositionalEncoding, TimestepEmbedder, MotionPro
 
 class OutputProcessMLP(nn.Module):
     """
-    Projects transformer output from latent space back to pose space.
-
     Input:  x: [T, B, latent_dim]
-    Output: y: [B, K, D_feat, T]
+    Output: [B, K, D, T]
     """
 
     def __init__(
@@ -26,7 +24,6 @@ class OutputProcessMLP(nn.Module):
         self.latent_dim = latent_dim
         self.njoints = njoints
         self.nfeats = nfeats
-        self.hidden_dim = hidden_dim
 
         self.mlp = nn.Sequential(
             nn.Linear(latent_dim, hidden_dim),
@@ -46,35 +43,34 @@ class OutputProcessMLP(nn.Module):
                 f"OutputProcessMLP latent dim mismatch: got {d}, expected {self.latent_dim}"
             )
 
-        x = self.mlp(x)                              # [T, B, input_feats]
-        x = x.reshape(t, b, self.njoints, self.nfeats)  # [T, B, K, D_feat]
-        x = x.permute(1, 2, 3, 0).contiguous()       # [B, K, D_feat, T]
+        x = self.mlp(x)                                   # [T, B, input_feats]
+        x = x.reshape(t, b, self.njoints, self.nfeats)    # [T, B, K, D]
+        x = x.permute(1, 2, 3, 0).contiguous()            # [B, K, D, T]
         return x
 
 
 class SignLanguagePoseDiffusion(nn.Module):
     """
-    Diffusion denoiser for sign-language pose synthesis.
+    Diffusion denoiser for sign-language pose generation.
 
-    Canonical internal sequence format: [T, B, D]
+    Expected input shapes:
+        fluent_clip   : [B, K, D, T_chunk]   noisy sample x_t
+        disfluent_seq : [B, K, D, T_cond]    condition
+        previous_output: [B, K, D, T_hist]   optional history
+        t             : [B]
 
-    External input format:
-        fluent_clip     : [B, K, D_feat, T_chunk]   noisy sample x_t
-        disfluent_seq   : [B, K, D_feat, T_cond]    conditioning sequence
-        previous_output : [B, K, D_feat, T_hist]    optional fluent history
-
-    Output: predicted clean chunk: [B, K, D_feat, T_chunk]
+    Output: [B, K, D, T_chunk]
 
     Fixes vs original:
-      - Separate PositionalEncoding instance for each stream (no double-PE on
-        time embedding; noisy / cond / history get their own position indices
-        from 0).
-      - Per-stream classifier-free-guidance masks with learnable null
-        embeddings (not zero-masking).
-      - `forward_with_cfg` for guided sampling at inference.
-      - Residual post-projection with LayerNorm.
-      - Device transfers removed from forward (done by DataLoader / training loop).
-      - Lower default dropout.
+      - Separate PositionalEncoding per stream → each starts at position 0.
+      - Time embedding no longer gets PE applied twice.
+      - Per-stream classifier-free-guidance with learnable null embeddings.
+      - forward_with_cfg() for guided sampling at inference.
+      - fusion_proj wrapped in a residual + LayerNorm block.
+      - GRU honours self.batch_first (and is bidirectional).
+      - Device transfers removed from forward (do them in the data loader).
+      - Default dropout lowered.
+      - Unused `ablation`, `legacy` flags removed.
     """
 
     def __init__(
@@ -90,12 +86,13 @@ class SignLanguagePoseDiffusion(nn.Module):
         dropout: float = 0.1,              # ★ was 0.2
         activation: str = "gelu",
         arch: str = "trans_enc",
-        cond_mask_prob: float = 0.1,       # ★ reasonable default for CFG
+        cond_mask_prob: float = 0.1,       # ★ sensible CFG default
+        batch_first: bool = True,
     ):
         super().__init__()
 
-        if arch not in {"trans_enc", "gru", "trans_dec"}:
-            raise ValueError("arch must be one of: trans_enc, gru, trans_dec")
+        if arch not in {"trans_enc", "trans_dec", "gru"}:
+            raise ValueError("arch must be one of ['trans_enc', 'trans_dec', 'gru']")
 
         self.input_feats = input_feats
         self.chunk_len = chunk_len
@@ -109,55 +106,53 @@ class SignLanguagePoseDiffusion(nn.Module):
         self.activation = activation
         self.arch = arch
         self.cond_mask_prob = cond_mask_prob
+        self.batch_first = batch_first
 
-        # ★ SEPARATE positional encoders per stream so each starts from pos 0.
-        # This avoids treating "cond frame 0" as if it were "cond_start + offset".
+        # ★ FIX: separate positional encoders per stream. Each stream starts
+        # at position 0 so "cond frame 0" isn't treated as "frame T_chunk+1".
         self.pe_noisy = PositionalEncoding(d_model=latent_dim, dropout=dropout)
         self.pe_cond = PositionalEncoding(d_model=latent_dim, dropout=dropout)
         self.pe_hist = PositionalEncoding(d_model=latent_dim, dropout=dropout)
 
-        # TimestepEmbedder uses its own PE internally (inherited from CAMDM);
-        # we do NOT apply another PE on top of its output.
-        self.embed_timestep = TimestepEmbedder(
-            latent_dim,
-            self.pe_noisy,  # only used internally by the embedder
-        )
+        # TimestepEmbedder applies its own PE internally — we do NOT apply
+        # another PE on top of it.
+        self.embed_timestep = TimestepEmbedder(latent_dim, self.pe_noisy)
 
-        # Separate encoders for the semantic streams.
+        # Separate encoders for separate semantic roles.
         self.noisy_encoder = MotionProcess(input_feats, latent_dim)
         self.disfluent_encoder = MotionProcess(input_feats, latent_dim)
         self.history_encoder = MotionProcess(input_feats, latent_dim)
 
-        # ★ Learnable null embeddings for classifier-free guidance.
-        # Shape [1, 1, D] so they broadcast over [T, B, D].
+        # ★ FIX: learnable null embeddings for classifier-free guidance.
+        # Shape [1, 1, D] broadcasts over either [B, T, D] or [T, B, D].
         self.null_disfluent = nn.Parameter(torch.zeros(1, 1, latent_dim))
         self.null_history = nn.Parameter(torch.zeros(1, 1, latent_dim))
         nn.init.normal_(self.null_disfluent, std=0.02)
         nn.init.normal_(self.null_history, std=0.02)
 
-        if arch == "trans_enc":
+        if self.arch == "trans_enc":
             encoder_layer = nn.TransformerEncoderLayer(
                 d_model=latent_dim,
                 nhead=num_heads,
                 dim_feedforward=ff_size,
                 dropout=dropout,
                 activation=activation,
-                batch_first=False,
-                norm_first=True,  # ★ pre-LN: more stable training
+                batch_first=batch_first,
+                norm_first=True,              # ★ pre-LN is more stable
             )
             self.sequence_encoder = nn.TransformerEncoder(
                 encoder_layer,
                 num_layers=num_layers,
             )
 
-        elif arch == "trans_dec":
+        elif self.arch == "trans_dec":
             decoder_layer = nn.TransformerDecoderLayer(
                 d_model=latent_dim,
                 nhead=num_heads,
                 dim_feedforward=ff_size,
                 dropout=dropout,
                 activation=activation,
-                batch_first=False,
+                batch_first=batch_first,
                 norm_first=True,
             )
             self.sequence_encoder = nn.TransformerDecoder(
@@ -165,21 +160,22 @@ class SignLanguagePoseDiffusion(nn.Module):
                 num_layers=num_layers,
             )
 
-        elif arch == "gru":
-            # ★ bidirectional GRU + projection back to latent_dim
+        else:  # gru
+            # ★ FIX: honour self.batch_first (was hard-coded True).
+            # Also bidirectional — denoisers need full context.
             self.sequence_encoder = nn.GRU(
                 input_size=latent_dim,
                 hidden_size=latent_dim,
                 num_layers=num_layers,
-                batch_first=False,
+                batch_first=batch_first,
                 dropout=dropout if num_layers > 1 else 0.0,
                 bidirectional=True,
             )
             self.gru_proj = nn.Linear(latent_dim * 2, latent_dim)
 
-        # ★ Post-projection with residual + LayerNorm
+        # ★ Residual post-projection with LayerNorm.
         self.post_norm = nn.LayerNorm(latent_dim)
-        self.post_proj = nn.Sequential(
+        self.fusion_proj = nn.Sequential(
             nn.Linear(latent_dim, latent_dim),
             nn.SiLU(),
             nn.Linear(latent_dim, latent_dim),
@@ -196,70 +192,94 @@ class SignLanguagePoseDiffusion(nn.Module):
     # -----------------------------------------------------------------
     # Encoding helpers
     # -----------------------------------------------------------------
-    def _encode_motion(self, encoder: nn.Module, x: torch.Tensor, name: str) -> torch.Tensor:
+    def _encode_sequence(self, encoder: nn.Module, x: torch.Tensor) -> torch.Tensor:
         """
-        Expects x as [B, K, D_feat, T]. Returns [T, B, latent_dim].
+        Input:  x: [B, K, D, T]
+        Output: if batch_first=True  -> [B, T, latent_dim]
+                else                 -> [T, B, latent_dim]
+        Assumes MotionProcess returns [T, B, latent_dim].
         """
         if x.dim() != 4:
-            raise ValueError(f"{name} expected [B, K, D_feat, T], got {tuple(x.shape)}")
+            raise ValueError(f"Expected [B, K, D, T], got {tuple(x.shape)}")
 
-        x_enc = encoder(x)
-
-        if x_enc.dim() != 3:
+        x_raw = encoder(x)
+        if x_raw.dim() != 3:
+            raise ValueError(f"Unexpected encoder output shape: {tuple(x_raw.shape)}")
+        if x_raw.shape[-1] != self.latent_dim:
             raise ValueError(
-                f"{name} encoder returned unexpected shape {tuple(x_enc.shape)}; "
-                f"expected [T, B, D]"
+                f"Encoder latent dim mismatch: got {x_raw.shape[-1]}, expected {self.latent_dim}"
             )
 
-        t, b, d = x_enc.shape
-        if d != self.latent_dim:
-            raise ValueError(
-                f"{name} latent dim mismatch: got {d}, expected {self.latent_dim}"
-            )
+        if self.batch_first:
+            return x_raw.permute(1, 0, 2).contiguous()   # [B, T, D]
+        return x_raw.contiguous()                        # [T, B, D]
 
-        return x_enc.contiguous()  # [T, B, D]
-
-    def _encode_timestep(self, t: torch.Tensor, batch_size: int) -> torch.Tensor:
+    def _prepare_timestep_embedding(self, t: torch.Tensor) -> torch.Tensor:
         """
-        Returns timestep token(s) as [1, B, D]. TimestepEmbedder already
-        applies its own position encoding internally; we do not add more.
+        Returns: if batch_first=True  -> [B, 1, D]
+                 else                 -> [1, B, D]
+        NOTE: TimestepEmbedder already applies PE internally. We do NOT
+        re-apply it.
         """
         t_emb = self.embed_timestep(t)
 
         if t_emb.dim() == 2:
-            t_emb = t_emb.unsqueeze(0)        # [B, D] -> [1, B, D]
+            t_emb = t_emb.unsqueeze(0)                    # [1, B, D]
         elif t_emb.dim() != 3:
             raise ValueError(f"Unexpected timestep embedding shape: {tuple(t_emb.shape)}")
 
-        if t_emb.shape[1] != batch_size:
+        if t_emb.shape[-1] != self.latent_dim:
             raise ValueError(
-                f"Timestep embedding batch mismatch: got {t_emb.shape[1]}, expected {batch_size}"
-            )
-        if t_emb.shape[2] != self.latent_dim:
-            raise ValueError(
-                f"Timestep embedding latent mismatch: got {t_emb.shape[2]}, expected {self.latent_dim}"
+                f"Timestep embedding latent dim mismatch: got {t_emb.shape[-1]}, expected {self.latent_dim}"
             )
 
-        return t_emb.contiguous()  # [1, B, D]
+        if self.batch_first:
+            return t_emb.permute(1, 0, 2).contiguous()   # [B, 1, D]
+        return t_emb.contiguous()                        # [1, B, D]
 
     # -----------------------------------------------------------------
-    # CFG masking (per-stream, learnable null embeddings)
+    # CFG masking helpers
     # -----------------------------------------------------------------
     def _apply_stream_mask(
         self,
-        tokens: torch.Tensor,          # [T, B, D]
+        tokens: torch.Tensor,          # [B, T, D] or [T, B, D]
         null_embed: nn.Parameter,      # [1, 1, D]
         drop_prob: float,
     ) -> torch.Tensor:
+        """
+        Per-sample, per-stream mask: replaces a sample's tokens with the
+        learnable null embedding with probability `drop_prob`. Independent
+        across streams and across samples.
+        """
         if drop_prob <= 0.0 or not self.training:
             return tokens
-        _, batch_size, _ = tokens.shape
-        drop = (torch.rand(batch_size, device=tokens.device) < drop_prob)  # [B]
-        if not drop.any():
-            return tokens
-        drop = drop.view(1, batch_size, 1).to(tokens.dtype)                # [1, B, 1]
-        null = null_embed.expand_as(tokens)                                # [T, B, D]
+
+        if self.batch_first:
+            B = tokens.shape[0]
+            drop = (torch.rand(B, device=tokens.device) < drop_prob)    # [B]
+            if not drop.any():
+                return tokens
+            drop = drop.view(B, 1, 1).to(tokens.dtype)                  # [B, 1, 1]
+        else:
+            B = tokens.shape[1]
+            drop = (torch.rand(B, device=tokens.device) < drop_prob)    # [B]
+            if not drop.any():
+                return tokens
+            drop = drop.view(1, B, 1).to(tokens.dtype)                  # [1, B, 1]
+
+        null = null_embed.expand_as(tokens)
         return tokens * (1.0 - drop) + null * drop
+
+    # -----------------------------------------------------------------
+    # PE helper (handles batch_first internally since CAMDM PE wants [T,B,D])
+    # -----------------------------------------------------------------
+    def _apply_pe(self, tokens: torch.Tensor, pe_module: nn.Module) -> torch.Tensor:
+        if self.batch_first:
+            # [B, T, D] -> [T, B, D] -> PE -> [B, T, D]
+            tokens_tb = tokens.permute(1, 0, 2).contiguous()
+            tokens_tb = pe_module(tokens_tb)
+            return tokens_tb.permute(1, 0, 2).contiguous()
+        return pe_module(tokens)
 
     # -----------------------------------------------------------------
     # Forward
@@ -270,88 +290,100 @@ class SignLanguagePoseDiffusion(nn.Module):
         disfluent_seq: torch.Tensor,
         t: torch.Tensor,
         previous_output: Optional[torch.Tensor] = None,
-        force_drop_disfluent: bool = False,   # ★ for CFG sampling
+        force_drop_disfluent: bool = False,
         force_drop_history: bool = False,
     ) -> torch.Tensor:
+        """
+        fluent_clip = x_t noisy target. Device transfers are the caller's
+        responsibility (do it once in the DataLoader / training loop).
+        """
         if fluent_clip.dim() != 4:
-            raise ValueError(f"fluent_clip expected [B, K, D_feat, T], got {tuple(fluent_clip.shape)}")
+            raise ValueError(f"fluent_clip expected [B, K, D, T], got {tuple(fluent_clip.shape)}")
         if disfluent_seq.dim() != 4:
-            raise ValueError(f"disfluent_seq expected [B, K, D_feat, T], got {tuple(disfluent_seq.shape)}")
+            raise ValueError(f"disfluent_seq expected [B, K, D, T], got {tuple(disfluent_seq.shape)}")
         if previous_output is not None and previous_output.dim() != 4:
             raise ValueError(
-                f"previous_output expected [B, K, D_feat, T], got {tuple(previous_output.shape)}"
+                f"previous_output expected [B, K, D, T], got {tuple(previous_output.shape)}"
             )
 
-        batch_size = fluent_clip.shape[0]
         t_chunk = fluent_clip.shape[-1]
 
-        # --- 1. Encode each stream in [T, B, D] ---
-        noisy_tokens = self._encode_motion(self.noisy_encoder, fluent_clip, "noisy")
-        cond_tokens = self._encode_motion(self.disfluent_encoder, disfluent_seq, "disfluent")
-        time_tokens = self._encode_timestep(t, batch_size)  # [1, B, D]
+        # --- 1. encode streams ---
+        t_emb = self._prepare_timestep_embedding(t)
+        noisy_emb = self._encode_sequence(self.noisy_encoder, fluent_clip)
+        disfluent_emb = self._encode_sequence(self.disfluent_encoder, disfluent_seq)
 
-        history_tokens = None
+        history_emb = None
         if previous_output is not None and previous_output.shape[-1] > 0:
-            history_tokens = self._encode_motion(self.history_encoder, previous_output, "history")
+            history_emb = self._encode_sequence(self.history_encoder, previous_output)
 
-        # --- 2. Per-stream independent positional encoding ---
-        # Each stream starts at position 0 — the model learns stream identity
-        # implicitly from the separate encoders, not from arbitrary offsets.
-        noisy_tokens = self.pe_noisy(noisy_tokens)
-        cond_tokens = self.pe_cond(cond_tokens)
-        if history_tokens is not None:
-            history_tokens = self.pe_hist(history_tokens)
+        # --- 2. per-stream positional encoding (each starts at 0) ---
+        noisy_emb = self._apply_pe(noisy_emb, self.pe_noisy)
+        disfluent_emb = self._apply_pe(disfluent_emb, self.pe_cond)
+        if history_emb is not None:
+            history_emb = self._apply_pe(history_emb, self.pe_hist)
 
-        # --- 3. Classifier-free-guidance masking (per stream, independent) ---
+        # --- 3. classifier-free-guidance masking (per-stream, independent) ---
         if force_drop_disfluent:
-            cond_tokens = self.null_disfluent.expand_as(cond_tokens)
+            disfluent_emb = self.null_disfluent.expand_as(disfluent_emb)
         else:
-            cond_tokens = self._apply_stream_mask(
-                cond_tokens, self.null_disfluent, self.cond_mask_prob
+            disfluent_emb = self._apply_stream_mask(
+                disfluent_emb, self.null_disfluent, self.cond_mask_prob
             )
 
-        if history_tokens is not None:
+        if history_emb is not None:
             if force_drop_history:
-                history_tokens = self.null_history.expand_as(history_tokens)
+                history_emb = self.null_history.expand_as(history_emb)
             else:
-                history_tokens = self._apply_stream_mask(
-                    history_tokens, self.null_history, self.cond_mask_prob
+                history_emb = self._apply_stream_mask(
+                    history_emb, self.null_history, self.cond_mask_prob
                 )
 
-        # --- 4. Build condition stream (time is a single summary token) ---
-        cond_parts = [time_tokens, cond_tokens]
-        if history_tokens is not None:
-            cond_parts.append(history_tokens)
-        cond_stream = torch.cat(cond_parts, dim=0)  # [T_cond_total, B, D]
+        # --- 4. assemble condition stream ---
+        cond_tokens = [t_emb, disfluent_emb]
+        if history_emb is not None:
+            cond_tokens.append(history_emb)
 
-        # --- 5. Sequence modeling ---
-        if self.arch == "trans_enc":
-            xseq = torch.cat([noisy_tokens, cond_stream], dim=0)  # [T_total, B, D]
-            x_encoded = self.sequence_encoder(xseq)               # [T_total, B, D]
-            x_target = x_encoded[:t_chunk]                        # [T_chunk, B, D]
+        cat_dim = 1 if self.batch_first else 0
 
-        elif self.arch == "gru":
-            xseq = torch.cat([noisy_tokens, cond_stream], dim=0)
-            x_encoded, _ = self.sequence_encoder(xseq)            # [T_total, B, 2*D]
-            x_encoded = self.gru_proj(x_encoded)                  # [T_total, B, D]
-            x_target = x_encoded[:t_chunk]
-
-        elif self.arch == "trans_dec":
-            # No extra PE here — tokens are already positionally encoded above.
-            tgt = noisy_tokens
-            memory = cond_stream
-            x_target = self.sequence_encoder(tgt=tgt, memory=memory)  # [T_chunk, B, D]
+        # --- 5. sequence modeling ---
+        if self.arch == "trans_dec":
+            memory = torch.cat(cond_tokens, dim=cat_dim)
+            tgt = noisy_emb
+            x_encoded = self.sequence_encoder(tgt=tgt, memory=memory)
+            x_target = x_encoded
 
         else:
-            raise ValueError(f"Unsupported arch: {self.arch}")
+            # encoder / gru: noisy first, then conditions
+            cond_stream = torch.cat(cond_tokens, dim=cat_dim)
+            xseq = torch.cat([noisy_emb, cond_stream], dim=cat_dim)
 
-        # --- 6. Residual post-projection ---
+            if self.arch == "trans_enc":
+                x_encoded = self.sequence_encoder(xseq)
+            elif self.arch == "gru":
+                x_encoded, _ = self.sequence_encoder(xseq)
+                x_encoded = self.gru_proj(x_encoded)          # 2D -> D
+            else:
+                raise ValueError("Unsupported architecture")
+
+            # slice first T_chunk tokens (they correspond to the noisy path)
+            if self.batch_first:
+                x_target = x_encoded[:, :t_chunk, :]          # [B, T_chunk, D]
+            else:
+                x_target = x_encoded[:t_chunk, :, :]          # [T_chunk, B, D]
+
+        # --- 6. residual fusion_proj ---
         residual = x_target
         x_target = self.post_norm(x_target)
-        x_target = self.post_proj(x_target) + residual
+        x_target = self.fusion_proj(x_target) + residual
 
-        # --- 7. Decode to pose space ---
-        output = self.pose_projection(x_target)  # [B, K, D_feat, T_chunk]
+        # --- 7. prepare for OutputProcessMLP (expects [T, B, D]) ---
+        if self.batch_first:
+            x_out = x_target.permute(1, 0, 2).contiguous()    # [T, B, D]
+        else:
+            x_out = x_target
+
+        output = self.pose_projection(x_out)                  # [B, K, D, T]
         return output
 
     # -----------------------------------------------------------------
@@ -367,13 +399,8 @@ class SignLanguagePoseDiffusion(nn.Module):
         guidance_scale: float = 2.0,
     ) -> torch.Tensor:
         """
-        Classifier-free guidance at inference time.
-
-        Runs the model twice — once with real conditioning, once with null
-        conditioning — and extrapolates:
-            pred = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
-
-        guidance_scale=1.0 reproduces the conditional output.
+        pred = pred_uncond + guidance_scale * (pred_cond - pred_uncond)
+        guidance_scale=1.0 -> plain conditional.
         """
         pred_cond = self.forward(
             fluent_clip=fluent_clip,
@@ -381,7 +408,6 @@ class SignLanguagePoseDiffusion(nn.Module):
             t=t,
             previous_output=previous_output,
         )
-
         if guidance_scale == 1.0:
             return pred_cond
 
@@ -404,15 +430,7 @@ class SignLanguagePoseDiffusion(nn.Module):
         t: torch.Tensor,
         y: Dict[str, torch.Tensor],
     ) -> torch.Tensor:
-        """
-        Used by the diffusion process during training.
-
-        y:
-            {
-                "input_sequence": [B, K, D_feat, T_cond],
-                "previous_output": [B, K, D_feat, T_hist]  (optional)
-            }
-        """
+        """Training-time hook used by the diffusion process."""
         if "input_sequence" not in y:
             raise KeyError("y must contain 'input_sequence'")
 
