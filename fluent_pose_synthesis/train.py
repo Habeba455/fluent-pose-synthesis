@@ -1,15 +1,3 @@
-"""
-Simple Kaggle-ready training script for sign-language pose diffusion.
-
-Usage in Kaggle:
-    !python train_lite.py
-
-Or from a notebook cell:
-    exec(open('train_lite.py').read())
-
-Edit the CONFIG section below to change hyperparameters.
-"""
-
 import sys
 import time
 import json
@@ -28,28 +16,22 @@ from CAMDM.diffusion.create_diffusion import create_gaussian_diffusion
 from CAMDM.utils.common import fixseed
 from CAMDM.utils.logger import Logger
 
-# ★ Import the FIXED modules
 from fluent_pose_synthesis.core.models import SignLanguagePoseDiffusion
 from fluent_pose_synthesis.core.training import PoseTrainingPortal
 from fluent_pose_synthesis.data.load_data import SignLanguagePoseDataset
 
 
-# =========================================================
-# CONFIG — EDIT THESE VALUES
-# =========================================================
 CONFIG = {
-    # Paths
     "data": "/kaggle/working/final_dataset",
     "save": "/kaggle/working/train_output",
-    "resume": None,                       # or path to checkpoint
+    "resume": None,
 
-    # Architecture
     "arch": {
-        "decoder": "trans_enc",           # "trans_enc" | "trans_dec" | "gru"
+        "decoder": "trans_enc",
         "chunk_len": 40,
         "history_len": 10,
-        "keypoints": 178,                 # ← CHECK THIS matches your data
-        "dims": 3,                        # ← CHECK THIS (2 or 3)
+        "keypoints": 178,
+        "dims": 3,
         "latent_dim": 256,
         "ff_size": 1024,
         "num_layers": 8,
@@ -58,7 +40,6 @@ CONFIG = {
         "activation": "gelu",
     },
 
-    # Training
     "trainer": {
         "batch_size": 32,
         "workers": 2,
@@ -79,10 +60,9 @@ CONFIG = {
         "lambda_vel": 1.0,
         "lambda_accel": 1.0,
         "load_num": -1,
-        "stride": 20,                     # windowing stride (chunk_len // 2)
+        "stride": 20,
     },
 
-    # Diffusion
     "diff": {
         "noise_schedule": "cosine",
         "diffusion_steps": 8,
@@ -96,16 +76,17 @@ CONFIG = {
         "clip_denoised": False,
     },
 
-    # Misc
     "seed": 1024,
 }
 
 
-# =========================================================
-# TORCH LOAD PATCH
-# =========================================================
 torch.serialization.add_safe_globals([
-    SimpleNamespace, np.int64, np.int32, np.float64, np.float32, np.bool_,
+    SimpleNamespace,
+    np.int64,
+    np.int32,
+    np.float64,
+    np.float32,
+    np.bool_,
 ])
 
 _original_torch_load = torch.load
@@ -113,46 +94,44 @@ _original_torch_load = torch.load
 
 def patched_torch_load(*args, **kwargs):
     kwargs.setdefault("weights_only", False)
+
     if not torch.cuda.is_available():
         kwargs.setdefault("map_location", torch.device("cpu"))
+
     return _original_torch_load(*args, **kwargs)
 
 
 torch.load = patched_torch_load
 
 
-# =========================================================
-# CONFIG HELPERS
-# =========================================================
 def dict_to_namespace(d):
-    """Recursively convert dict -> SimpleNamespace."""
     if isinstance(d, dict):
         return SimpleNamespace(**{k: dict_to_namespace(v) for k, v in d.items()})
+
     return d
 
 
 def config_to_dict(cfg):
-    """Recursively convert SimpleNamespace / Path -> JSON-safe dict."""
     if isinstance(cfg, SimpleNamespace):
         return {k: config_to_dict(v) for k, v in vars(cfg).items()}
+
     if isinstance(cfg, Path):
         return str(cfg)
+
     if isinstance(cfg, torch.device):
         return str(cfg)
+
     if isinstance(cfg, (list, tuple)):
         return [config_to_dict(i) for i in cfg]
+
     return cfg
 
 
-# =========================================================
-# TRAIN
-# =========================================================
 def train(config, resume_path, logger, tb_writer):
-    """Main training loop."""
     np_dtype = np.float32
 
-    # --- Training dataset (computes its own stats) ---
     logger.info("Loading training dataset...")
+
     train_dataset = SignLanguagePoseDataset(
         data_dir=config.data,
         split="train",
@@ -172,24 +151,27 @@ def train(config, resume_path, logger, tb_writer):
         pin_memory=True,
         collate_fn=zero_pad_collator,
     )
+
     logger.info(
         f"Training Dataset: {len(train_dataset)} windows "
         f"(chunk_len={config.arch.chunk_len}, history_len={config.arch.history_len})"
     )
 
-    # --- Validation dataset (uses training stats — no data leakage) ---
     logger.info("Loading validation dataset...")
+
     train_stats = train_dataset.get_stats_dict()
+
     validation_dataset = SignLanguagePoseDataset(
         data_dir=config.data,
-        split="val",                              # ★ matches your folder name
+        split="val",
         chunk_len=config.arch.chunk_len,
         history_len=getattr(config.arch, "history_len", 10),
         dtype=np_dtype,
         limited_num=config.trainer.load_num,
         stride=getattr(config.trainer, "stride", None),
-        external_stats=train_stats,               # ★ critical fix
+        external_stats=train_stats,
     )
+
     validation_dataloader = DataLoader(
         validation_dataset,
         batch_size=1,
@@ -199,13 +181,13 @@ def train(config, resume_path, logger, tb_writer):
         pin_memory=True,
         collate_fn=zero_pad_collator,
     )
+
     logger.info(f"Validation Dataset: {len(validation_dataset)} windows")
 
-    # --- Diffusion + Model ---
     diffusion = create_gaussian_diffusion(config)
+
     input_feats = config.arch.keypoints * config.arch.dims
 
-    # ★ only pass parameters the fixed model accepts
     model = SignLanguagePoseDiffusion(
         input_feats=input_feats,
         chunk_len=config.arch.chunk_len,
@@ -223,11 +205,16 @@ def train(config, resume_path, logger, tb_writer):
     ).to(config.device)
 
     n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+
     logger.info(f"Model: {type(model).__name__} | {n_params:,} trainable params")
 
-    # --- Trainer ---
     trainer = PoseTrainingPortal(
-        config, model, diffusion, train_dataloader, logger, tb_writer,
+        config,
+        model,
+        diffusion,
+        train_dataloader,
+        logger,
+        tb_writer,
         validation_dataloader=validation_dataloader,
     )
 
@@ -242,26 +229,22 @@ def train(config, resume_path, logger, tb_writer):
     profiler_dir.mkdir(parents=True, exist_ok=True)
 
     logger.info(f"Starting training from epoch {trainer.epoch}")
+
     trainer.run_loop(
-        enable_profiler=False,                # set True for profiling
+        enable_profiler=False,
         profiler_directory=str(profiler_dir),
     )
 
 
-# =========================================================
-# MAIN
-# =========================================================
 def main():
     start_time = time.time()
 
-    # Build config namespace
     config = dict_to_namespace(CONFIG)
     config.data = Path(config.data)
     config.save = Path(config.save)
 
     fixseed(config.seed)
 
-    # Handle existing save folder
     if config.save.exists() and config.resume is None:
         print(f"Save folder exists: {config.save}")
         print("Deleting it to start fresh.")
@@ -269,16 +252,18 @@ def main():
 
     config.save.mkdir(parents=True, exist_ok=True)
 
-    # Resume path
     resume_path = None
+
     if config.resume:
         resume_path = Path(config.resume)
     elif config.save.exists():
         best_ckpt = config.save / "best.pt"
+
         if best_ckpt.exists():
             resume_path = best_ckpt
         else:
             ckpts = list(config.save.glob("weights_*.pt"))
+
             if ckpts:
                 resume_path = max(ckpts, key=lambda p: int(p.stem.split("_")[1]))
 
@@ -286,16 +271,19 @@ def main():
     tb_writer = SummaryWriter(log_dir=config.save / "runtime")
 
     config.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     logger.info(f"Device: {config.device}")
 
     with open(config.save / "config.json", "w", encoding="utf-8") as f:
         json.dump(config_to_dict(config), f, indent=4)
-    logger.info(f"Saved config to {config.save / 'config.json'}")
 
+    logger.info(f"Saved config to {config.save / 'config.json'}")
     logger.info("Launching training")
+
     train(config, resume_path, logger, tb_writer)
 
     total_min = (time.time() - start_time) / 60
+
     logger.info(f"Total training time: {total_min:.2f} minutes")
 
 
